@@ -1,46 +1,45 @@
-# Offline Phase: Empirical Interpolation Method
+# Offline Phase: Empirical Interpolation Method (EIM)
 # Author: Stefano Riva, PhD Student, NRG, Politecnico di Milano
-# Latest Code Update: 04 November 2024
-# Latest Doc  Update: 04 November 2024
+# Latest Code Update: 07 October 2025
+# Latest Doc  Update: 07 October 2025
 
 import numpy as np
-from scipy import linalg
-from pyforce.tools.functions_list import FunctionsList
-    
-# EIM: offline
-class EIM():
+import scipy
+from collections import namedtuple
+import os
+
+import scipy.linalg
+
+from ..tools.functions_list import FunctionsList
+from ..tools.backends import IntegralCalculator, LoopProgress, Timer
+from .offline_base import OfflineDDROM
+
+class EIM(OfflineDDROM):
     r"""
-    This class is used to perform the offline phase of the Empirical Interpolation Method (EIM) to a scalar field.
-    Given a list of training snapshots, this class generates the magic functions and points through a greedy algorithm.
+    A class implementing the Empirical Interpolation Method (EIM) for dimensionality reduction and sensor placement.
 
     Parameters
     ----------
-    mesh : np.ndarray
-        Mesh Points shaped as :math:`\mathcal{N}_h\times gdim`, given :math:`gdim` be the number of independent coordinates (1,2 or 3).
-    name : str
-        Name of the snapshots (e.g., temperature T)
-    
+    grid: pv.UnstructuredGrid
+        The computational grid.
+    gdim: int, optional (default=3)
+        The geometric dimension of the problem. It can be either 2 or 3.
+    varname: str, optional (default='u')
+        The name of the variable to analyse. Default is 'u'.
     """
-    def __init__(self, mesh: np.ndarray, name: str) -> None:
-        
-        self.mesh = mesh
-        self.name = name
-        
-        self.Nh = mesh.shape[0]
-        self.gdim = mesh.shape[1]
-        
-    def offline(self, train_snap: FunctionsList, Mmax: int, _xm = None, verbose = False):
+
+    def fit(self, train_snaps: FunctionsList, Mmax: int, _xm_idx : list = None, verbose= False):
         r"""
         The greedy algorithm chooses the magic functions and magic points by minimising the reconstruction error.
         
         Parameters
         ----------
-        train_snap : FunctionsList
+        train_snaps : FunctionsList
             List of snapshots serving as training set.
         Mmax : int
             Integer input indicating the maximum number of functions and sensors to define
-        _xm : list, optional (default = None)
-            User-defined available indices positions for the points (sensors), if `None` the positions are all mesh elements.
+        _xm_idx : list, optional (default = None)
+            User-defined available indices for the points (sensors), if `None` the indices are all mesh elements.
         verbose : boolean, optional (Default = False) 
             If `True`, print of the progress is enabled.
             
@@ -53,166 +52,412 @@ class EIM():
         beta_coeff : np.ndarray
             Matrix of the reduced coefficients :math:`\{ \beta_m \}_{m=1}^M`, obtained by greedy procedure
         """
-        self.Ns = len(train_snap)
+
+        # Select if the user provided cell field data or point field data
+        if train_snaps.fun_shape == self.grid.n_cells:
+            self.field_type = 'cell'
+            self.Nh = self.grid.n_cells
+            nodes = self.grid.cell_centers().points
+        elif train_snaps.fun_shape == self.grid.n_points:
+            self.field_type = 'point'
+            self.Nh = self.grid.n_points
+            nodes = self.grid.points
+        else:
+            if train_snaps.fun_shape * self.gdim == self.grid.n_cells or train_snaps.fun_shape * self.gdim == self.grid.n_points:
+                raise ValueError(f"The shape of the input functions ({train_snaps.fun_shape}) seems to be a vector field, not supported: only scalar fields are allowed.")
+            
+            raise ValueError(f"The shape of the input functions ({train_snaps.fun_shape}) does not match the number of cells ({self.grid.n_cells}) or points ({self.grid.n_points}) of the grid.")
+        
+
+        Ns_train = len(train_snaps)
 
         # Generate sensor library
-        if _xm is None:
-            xm = np.arange(0, self.mesh.shape[0], 1, dtype=int)
+        if _xm_idx is None:
+            xm = np.arange(0, self.Nh, 1, dtype=int)
         else:
-            assert max(_xm) < self.mesh.shape[0], "Indices are out of range"
-            assert min(_xm) > 0, "Indices are out of range"
-            assert len(_xm) < self.mesh.shape[0], "List of positions not compatible with the mesh points"
-            
-            xm = np.asarray(_xm, dtype=int)
-            
-        beta_coeff = np.zeros((len(train_snap), Mmax))
-        
-        self.magic_fun = FunctionsList(dofs = train_snap.fun_shape)
+            xm = np.asarray(_xm_idx, dtype=int)
+
+        # Initialize arrays
+        beta_coeff = np.zeros((Mmax, len(train_snaps)))
+
+        self.magic_functions = FunctionsList(dofs = train_snaps.fun_shape)
+        self.magic_points = {
+            'idx': list(), 
+            'points': list()
+        }    
         self.generating_fun = list()
-        self.magic_points = {'idx': list(), 'points': list()}
-        
-        maxAbsErr = list()
-        maxRelErr = list()
-        
-        snap_matrix = train_snap.return_matrix()
-        
-        # Generating the first magic function and associated point
+
+        # Initialize errors
+        maxAbsErr = np.zeros(Mmax)
+
+        # Convert snaps to matrix
+        snaps_matrix = train_snaps.return_matrix()
+
+        # Generating the first magic function and associated point from the function maximizing the L_inf norm
         mm = 0
-        self.generating_fun.append( int(np.argmax(np.max(abs(snap_matrix[xm]), axis=0))) )
-        self.magic_points['idx'].append( xm[np.argmax(abs( snap_matrix[xm, self.generating_fun[mm]]))] )
-        self.magic_points['points'].append( self.mesh[self.magic_points['idx'][mm]] )
-        
-        self.magic_fun.append( snap_matrix[:, self.generating_fun[mm]] / (snap_matrix[self.magic_points['idx'][mm], self.generating_fun[mm]])  )
-        
-        # Generate the first interpolant
+
+        self.generating_fun.append(
+            np.abs(snaps_matrix[xm]).max(axis=0).argmax()
+        )
+        self.magic_points['idx'].append(
+            xm[np.abs(snaps_matrix[xm, self.generating_fun[mm]]).argmax()]
+        )
+        self.magic_points['points'].append(
+            nodes[self.magic_points['idx'][mm], :]
+        )
+        self.magic_functions.append(
+            snaps_matrix[:, self.generating_fun[mm]] / snaps_matrix[self.magic_points['idx'][mm], self.generating_fun[mm]]
+        )
+
+        # Generate the first interpolant 
         self.matrix_B = np.zeros((Mmax, Mmax))
-        self.matrix_B[mm, mm] = self.magic_fun(mm)[self.magic_points['idx'][mm]]
-        
-        beta_coeff[:,0] = snap_matrix[self.magic_points['idx'][mm]]
-        interpolant = self.magic_fun.return_matrix() @ beta_coeff[:,:mm+1].T
-        
-        assert interpolant.shape == snap_matrix.shape, "Interpolant shape mismatch with snap_matrix"
-        
+        self.matrix_B[mm, mm] = self.magic_functions[mm][self.magic_points['idx'][mm]]
+
+        beta_coeff[mm] = snaps_matrix[self.magic_points['idx'][mm]]
+        interpolants = self._reconstruct_from_coeffs(beta_coeff[mm].reshape(1, -1))
+
+        # Main Loop
         for mm in range(1, Mmax):
-            residual_matrix = snap_matrix - interpolant
-            
-            # Find the next maximum error
-            self.generating_fun.append( int(np.argmax(np.max(abs(residual_matrix[xm]), axis=0))) )
-            maxAbsErr.append( np.max(abs(residual_matrix[xm, self.generating_fun[mm]])) )
-            maxRelErr.append( maxAbsErr[mm-1] / np.max(snap_matrix[:, self.generating_fun[mm]]) )
+            residuals_matrix = snaps_matrix - interpolants.return_matrix()
+
+            # Find the next point with maximum residual
+            self.generating_fun.append(
+                np.abs(residuals_matrix[xm]).max(axis=0).argmax()
+            )
+
+            # Assign maximum errors
+            maxAbsErr[mm-1] = np.abs(residuals_matrix[xm, self.generating_fun[mm]]).max()
 
             if verbose:
-                print(f'  Iteration {iter+0:03} | Abs Err: {maxAbsErr[mm-1]:.2e} | Rel Err: {maxRelErr[mm-1]:.2e}', end="\r")
+                print(f'  Iteration {(mm+1)+0:03} | Abs Err (Linfty): {maxAbsErr[mm-1]:.2e}', end="\r")
 
             # Find the next magic point
-            self.magic_points['idx'].append( xm[np.argmax(abs( residual_matrix[xm, self.generating_fun[mm]]))] )
-            self.magic_points['points'].append( self.mesh[self.magic_points['idx'][mm]] )
-        
+            self.magic_points['idx'].append(
+                xm[np.abs(residuals_matrix[xm, self.generating_fun[mm]]).argmax()]
+            )
+            self.magic_points['points'].append(
+                nodes[self.magic_points['idx'][mm], :]
+            )
+
             # Generate the next magic function
-            self.magic_fun.append( residual_matrix[:, self.generating_fun[mm]] / residual_matrix[self.magic_points['idx'][mm], self.generating_fun[mm]] )
-            
-            # Build matrix B
-            self.matrix_B[:mm+1, :mm+1] = self.magic_fun.return_matrix()[self.magic_points['idx']]
-            
-            # Create interpolants    
-            for muI in range(self.Ns):
-                rhs = snap_matrix[self.magic_points['idx'], muI]
-                beta_coeff[muI, :mm+1] = linalg.solve(self.matrix_B[:mm+1, :mm+1], rhs, lower = True)
-                
-            interpolant = self.magic_fun.return_matrix() @ beta_coeff[:,:mm+1].T
-            
-            assert interpolant.shape == snap_matrix.shape, "Interpolant shape mismatch with snap_matrix"
-        
-        residual_matrix = snap_matrix - interpolant
-            
-        # Find the next maximum error
-        last_gen_fun = int(np.argmax(np.max(abs(residual_matrix), axis=0)))
-        
-        maxAbsErr.append( np.max(residual_matrix[:, last_gen_fun]) )
-        maxRelErr.append( maxAbsErr[mm-1] / np.max(snap_matrix[:, last_gen_fun]) )
-        
+            self.magic_functions.append(
+                residuals_matrix[:, self.generating_fun[mm]] / residuals_matrix[self.magic_points['idx'][mm], self.generating_fun[mm]]
+            )
+
+            # Update matrix B
+            self.matrix_B[:mm+1, :mm+1] = self.magic_functions.return_matrix()[self.magic_points['idx']]
+
+            # Solve for the reduced coefficients
+            for mu_i in range(Ns_train):
+                beta_coeff[:mm+1, mu_i] = self._solve_eim_linear_system(snaps_matrix[self.magic_points['idx'], mu_i])
+
+            # Update the interpolant
+            interpolants = self._reconstruct_from_coeffs(beta_coeff[:mm+1])
+
+        # Final error assignment
+        residuals_matrix = snaps_matrix - interpolants.return_matrix()
+        self.generating_fun.append(
+            np.abs(residuals_matrix[xm]).max(axis=0).argmax()
+        )
+        maxAbsErr[mm] = np.abs(residuals_matrix[xm, self.generating_fun[-1]]).max()
+
         if verbose:
-            print(f'  Iteration {iter+0:03} | Abs Err: {maxAbsErr[-1]:.2e} | Rel Err: {maxRelErr[-1]:.2e}', end="\r")
+            print(f'  Iteration {(mm+1)+0:03} | Abs Err (Linfty): {maxAbsErr[mm-1]:.2e} - EIM done')
 
-        return maxAbsErr, maxRelErr, beta_coeff
-
-    def reconstruct(self, snap: np.ndarray, Mmax: int):
+        return maxAbsErr, beta_coeff
+    
+    def compute_lebesgue_constant(self):
         r"""
-        Computes the reduced coefficients :math:`\{\beta_m\}_{m=1}^{M_{max}}` with 'Mmax' magic functions/points (synthetic) and returns the vector measurement from the snapshots :math:`u`
+        This method computes the Lebesgue constant associated with the selected magic points.
+
+        The procedure exploits the Lagrange basis functions, depicted in `Tiglio and Villanueva (2021) <https://iopscience.iop.org/article/10.1088/1361-6382/abf894>`_.
+
+        Returns
+        -------
+        Lambda : float
+            The Lebesgue constant.
+        """
+
+        if not hasattr(self, 'magic_functions'):
+            raise ValueError("The model has not been fitted yet. Please call the 'fit' method before computing the Lebesgue constant.")
+
+        Lambda = list()
+
+        for mm in range(1, len(self.magic_functions)+1):
+            _mf = self.magic_functions.return_matrix()[:,:mm]
+            _matrix_B = self.matrix_B[:mm, :mm]
+            lagrange_fun = scipy.linalg.solve(_matrix_B, _mf.T, lower=True).T
+
+            # sum of absolute values at each point
+            leb_at_x = np.sum(np.abs(lagrange_fun), axis=1)
+
+            # max over domain
+            Lambda.append(np.max(leb_at_x))
+
+        return Lambda
+
+    def _reconstruct_from_coeffs(self, coeffs: np.ndarray):
+        r"""
+        This method reconstructs the function `u` from the reduced coefficients :math:`\{\beta_m\}_{m=1}^M` using the magic functions :math:`\{q_m\}_{m=1}^M`.
+
+        .. math::
+            u(\cdot;\,\boldsymbol{\mu}) = \sum_{k=1}^N \beta_k(\boldsymbol{\mu}) q_k(\cdot)
+
+
+        Parameters
+        ----------
+        coeffs : np.ndarray
+            Reduced coefficients :math:`\{\beta_m\}_{m=1}^M`, shaped :math:`(M,N_s)`.
+
+        Returns
+        -------
+        u : FunctionsList
+            Reconstructed functions.
+        """
+
+        assert coeffs.shape[0] <= len(self.magic_functions), "The number of coefficients must be lower to the number of magic functions"
+        coeffs = np.atleast_2d(coeffs)
+
+        reconstructed_snaps = FunctionsList(dofs = self.Nh)
+
+        for nn in range(coeffs.shape[1]):
+            reconstructed_snaps.append(
+                self.magic_functions.lin_combine(coeffs[:, nn])
+            )
+
+        return reconstructed_snaps
+    
+    def _solve_eim_linear_system(self, measures: np.ndarray):
+        r"""
+        Computes the reduced coefficients :math:`\{\beta_m\}_{m=1}^{M}}` with as many magic functions/points (synthetic) as the input measures :math:`M`.
         
         .. math::
             y_m = u(\vec{x}_m) \qquad m = 1, \dots, M_{max}
         
         Parameters
         ----------
-        snap : np.ndarray
-            Function from which the measuremets are computed.
-        Mmax: int
-            Maximum number of sensors to use
+        measures : np.ndarray
+            Measurements vector :math:`\{y_m\}_{m=1}^{M_{max}}` of the function `u` at the sensors locations.
 
         Returns
         ----------
         beta_coeff : np.ndarray
             Array of coefficients for the interpolant :math:`\{\beta_m\}_{m=1}^{M_{max}}`
-        Measure : np.ndarray
-            Array with the evaluation of the `snap` :math:`u` at the sensors locations
-
         """
 
-        # Computing the measurement vector
-        measure = snap[self.magic_points['idx']]
-        
-        # Solve the linear system
-        beta_coeff = linalg.solve(self.matrix_B[:Mmax, :Mmax], measure[:Mmax], lower = True)
+        assert measures.shape[0] <= len(self.magic_functions), "The number of measures must be equal to the number of magic functions"
 
-        return beta_coeff, measure
+        _m = measures.shape[0]
+        beta_coeff = scipy.linalg.solve(self.matrix_B[:_m, :_m], measures[:_m], lower = True)
 
-    def test_error(self, test_snap: FunctionsList, Mmax: int = None):
+        return beta_coeff
+    
+    def reconstruct(self, measures: np.ndarray):
         r"""
-        The absolute and relative error on the test set is computed, by solving the EIM system
-        
+        This method reconstructs the state by obtaining the reduced coefficients :math:`\{\beta_m\}_{m=1}^M` from the input measures :math:`\{y_m\}_{m=1}^M` by solving the EIM linear system
+
         .. math::
-            \mathbb{B}\boldsymbol{\beta} = \mathbf{y}
-        
+            \mathbb{B} \boldsymbol{\beta} = \mathbf{y}
+
+        where
+        - :math:`\mathbb{B}` is the matrix of magic functions
+        - :math:`\boldsymbol{\beta}` are the reduced coefficients
+        - :math:`\mathbf{y}` are the input measures
+
         Parameters
         ----------
-        test_snap : FunctionsList
-            List of functions belonging to the test set to reconstruct with EIM
-        Mmax : int, optional (default = None)
-            Maximum number of magic functions to use (if None is set to the number of magic functions/points)
-            
+        measures : np.ndarray
+            Input measures :math:`\{y_m\}_{m=1}^M`, shaped :math:`(M,N_s)`.
+
         Returns
+        -------
+        u : FunctionsList
+            Reconstructed functions.
+        """
+        beta_coeff = self._solve_eim_linear_system(measures)
+        return self._reconstruct_from_coeffs(beta_coeff)
+
+    def reduce(self, snaps: FunctionsList | np.ndarray, M: int = None):
+        r"""
+        This method can be used to generate the reduced coefficients based on the magic functions and points, by extracting the measures from the input functions and solve the associated EIM linear system.
+
+        Parameters
         ----------
-        meanAbsErr : np.ndarray
-            Average absolute error measured in :math:`l^2`
-        meanRelErr : np.ndarray
-            Average relative error measured in :math:`l^2`
-        beta_coeffs
-            Matrix of the reduced coefficients, obtained by the solving the EIM linear system
+        snaps : FunctionsList or np.ndarray
+            Function object to project onto the reduced space of dimension `M`.
+        M : int, optional (Default = None)
+            Number of magic functions/points to use for the projection. If `None`, all available magic functions/points are used.
+
+        Returns
+        -------
+        beta_coeff : np.ndarray
+            Reduced coefficients :math:`\{\beta_m\}_{m=1}^M`, shaped :math:`(M,N_s)`.
+
         """
 
-        # Check on the input M, maximum number of sensors to use
+        if M is None:
+            M = len(self.magic_functions)
+        else:
+            assert M <= len(self.magic_functions), "M cannot be larger than the number of magic functions available"
+
+        if isinstance(snaps, FunctionsList):
+            snaps = snaps.return_matrix()
+        elif isinstance(snaps, np.ndarray):
+            if snaps.ndim == 1:
+                snaps = np.atleast_2d(snaps).T # shape (Nh, 1)
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+
+        assert snaps.shape[0] == self.magic_functions.fun_shape, "Input shape must match the SVD modes shape."
+
+        measures = snaps[self.magic_points['idx'][:M]]
+
+        return self._solve_eim_linear_system(measures)
+    
+    def _get_measures(self, snaps: FunctionsList | np.ndarray, M: int = None):
+        r"""
+        This method extracts the measures from the input functions at the magic points locations.
+
+        Parameters
+        ----------
+        snaps : FunctionsList or np.ndarray
+            Function object to extract the measures from.
+        M : int, optional (Default = None)
+            Number of magic points to use for the extraction. If `None`, all available magic points
+
+        Returns
+        -------
+        measures : np.ndarray
+            Measures :math:`\{y_m\}_{m=1}^M`, shaped :math:`(M,N_s)`.
+        """
+
+        if isinstance(snaps, FunctionsList):
+            snaps = snaps.return_matrix()
+        elif isinstance(snaps, np.ndarray):
+            if snaps.ndim == 1:
+                snaps = np.atleast_2d(snaps).T
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+
+        assert snaps.shape[0] == self.magic_functions.fun_shape, "Input shape must match the SVD modes shape."
+
+        measures = snaps[self.magic_points['idx'][:M]]
+
+        return measures
+
+    def compute_errors(self, snaps: FunctionsList | np.ndarray, Mmax: int = None, verbose: bool = False):
+        r"""
+        Computes the errors between the original snapshots and the reconstructed ones.
+
+        Parameters
+        ----------
+        snaps : FunctionsList or np.ndarray
+            Original snapshots to compare with.
+        Mmax : int, optional
+            Maximum number of sensors and magic functions to use for the reconstruction. If None, all reduced basis is used.
+        verbose : bool, optional
+            If True, print progress messages. Default is False.
+
+        Returns
+        ----------
+        mean_abs_err : np.ndarray
+            Average absolute error measured in :math:`L^2`.
+        mean_rel_err : np.ndarray
+            Average relative error measured in :math:`L^2`.
+        computational_time : dict
+            Dictionary with the CPU time of the most relevant operations during the online phase.
+
+        """
+
+        if isinstance(snaps, FunctionsList):
+            Ns = len(snaps)
+            assert snaps.fun_shape == self.magic_functions.fun_shape, "The shape of the snapshots must match the shape of the magic functions."
+
+            # Convert FunctionsList to numpy array for processing
+            snaps = snaps.return_matrix()
+
+        elif isinstance(snaps, np.ndarray):
+            Ns = snaps.shape[1]
+            assert snaps.shape[0] == self.magic_functions.fun_shape, "The shape of the snapshots must match the shape of the magic functions."
+
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+
         if Mmax is None:
-            Mmax = len(self.magic_fun)
-        elif Mmax > len(self.magic_fun):
-            print('The maximum number of measures must not be higher than '+str(len(self.magic_fun))+' --> set equal to '+str(len(self.magic_fun)))
-            Mmax = len(self.magic_fun)
+            Mmax = len(self.magic_functions)
+        else:
+            assert Mmax <= len(self.magic_functions), f"Mmax={Mmax} must be less than or equal to the number of magic functions, {len(self.magic_functions)}."
 
-        Ns_test = len(test_snap)
-        absErr = np.zeros((Ns_test, Mmax))
-        relErr = np.zeros_like(absErr)
+        abs_err = np.zeros((Ns, Mmax))
+        rel_err = np.zeros((Ns, Mmax))
 
-        beta_coeffs = np.zeros((Mmax, Ns_test))
-        
-        for mu in range(Ns_test):
-            beta_coeffs[:, mu], _ = self.reconstruct(test_snap(mu), Mmax)
+        # Variables to store computational time
+        computational_time = dict()
+        computational_time['Measurements']    = np.zeros((Ns, Mmax))
+        computational_time['StateEstimation'] = np.zeros((Ns, Mmax))
+        computational_time['Errors']          = np.zeros((Ns, Mmax))
+
+        timer = Timer()
+
+        if verbose:
+            print(f"Computing L2 norm of snapshot", end='\r')
+
+        _snap_norm = list()
+        for mu_i in range(Ns):
+
+            timer.start()
+            _snap_norm.append(
+                self.calculator.L2_norm(snaps[:, mu_i])
+            )
             
-        snaps_norm = np.linalg.norm(test_snap.return_matrix(), axis=0)
+            computational_time['Errors'][mu_i, :] = timer.stop()
         
-        assert len(snaps_norm) == Ns_test
+        if verbose: 
+            progressBar = LoopProgress(msg = f"Computing errors - {self.varname}", final = Mmax)
 
         for mm in range(Mmax):
-            absErr[:,mm]  = np.linalg.norm(self.magic_fun.return_matrix()[:, :mm+1] @ beta_coeffs[:mm+1] - test_snap.return_matrix(), axis = 0)
-            relErr[:,mm]  = absErr[:,mm] / snaps_norm
 
-        return absErr.mean(axis = 0), relErr.mean(axis = 0), beta_coeffs
+            if verbose: 
+                progressBar.update(1, percentage = False)
+
+            timer.start()
+            _measures = self._get_measures(snaps, M=mm+1) # shape (M, Ns)
+            computational_time['Measurements'][:, mm] = timer.stop()
+
+            timer.start()
+            reconstructed_snaps = self.reconstruct(_measures)
+            computational_time['StateEstimation'][:, mm] = timer.stop()
+
+            for mu_i in range(Ns):
+                timer.start()
+                _resid = snaps[:, mu_i] - reconstructed_snaps(mu_i)
+                abs_err[mu_i, mm] = self.calculator.L2_norm(_resid)
+                rel_err[mu_i, mm] = abs_err[mu_i, mm] / _snap_norm[mu_i]
+                computational_time['Errors'][mu_i, mm] += timer.stop()
+
+        Results = namedtuple('Results', ['mean_abs_err', 'mean_rel_err', 'computational_time'])
+        _res = Results(mean_abs_err = abs_err.mean(axis = 0), mean_rel_err = rel_err.mean(axis = 0), computational_time = computational_time)
+
+        return _res
+
+
+    def save(self, path_folder: str, **kwargs):
+        r"""
+        Save the magic functions and points to a specified path.
+
+        Parameters
+        ----------
+        path_folder : str
+            The folder path where the model will be saved.
+        **kwargs : dict
+            Additional keyword arguments for saving options.
+        """
+
+        os.makedirs(path_folder, exist_ok=True)
+
+        # Save the magic functions
+        self.magic_functions.store( f'mf_{self.varname}',
+                                    filename=os.path.join(path_folder, f'mf_{self.varname}'),
+                                    **kwargs)
+        
+        np.save(os.path.join(path_folder, f'magic_points_{self.varname}.npy'), self.magic_points)

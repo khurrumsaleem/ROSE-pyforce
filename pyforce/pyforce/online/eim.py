@@ -1,4 +1,4 @@
-# Online Phase: Generalised Empirical Interpolation Method (EIM) - including regularized version
+# Online Phase: Empirical Interpolation Method (EIM)
 # Author: Stefano Riva, PhD Student, NRG, Politecnico di Milano
 # Latest Code Update: 07 October 2025
 # Latest Doc  Update: 07 October 2025
@@ -12,25 +12,25 @@ import scipy
 from ..tools.functions_list import FunctionsList
 from ..tools.backends import IntegralCalculator, LoopProgress, Timer
 from ..tools.write_read import ImportFunctionsList
-from .online_base import OnlineDDROM, OnlineSensors
+from .online_base import OnlineDDROM
 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-class GEIM(OnlineDDROM):
+class EIM(OnlineDDROM):
     r"""
-    A class to estimate the state using the GEIM.
+    A class to estimate the state using the EIM.
 
-    This class implements the generalized empirical interpolation method (GEIM) to estimate the state using measurements.
+    This class implements the empirical interpolation method (EIM) to estimate the state using measurements.
     
     Parameters
     ----------
     grid : pyvista.UnstructuredGrid
-        The computational grid. It is used to define the spatial domain of the snapshots.
+        The grid on which the POD is performed. It is used to define the spatial domain of the snapshots.
     gdim : int, optional (Default = 3)
         The geometric dimension of the grid. It can be either 2 or 3.
     varname : str, optional
-        The name of the variable to be used. Default is 'u'.
+        The name of the variable to be used for the POD. Default is 'u'.
 
     """
 
@@ -42,9 +42,9 @@ class GEIM(OnlineDDROM):
         self.tikhonov = None # Dictionary to store tikhonov regularization matrices
         self.train_beta_coeffs = None # Training reduced coefficients for Tikhonov regularization
 
-    def set_basis(self, basis: FunctionsList = None, path_folder: str = None, **kwargs):
+    def set_basis(self, basis = None, path_folder: str = None, **kwargs):
         """
-        Assign the magic functions to the GEIM model either from a FunctionsList object or by loading from a folder.
+        Assign the magic functions to the EIM model either from a FunctionsList object or by loading from a folder.
 
         Parameters
         ----------
@@ -69,50 +69,40 @@ class GEIM(OnlineDDROM):
         else:
             raise ValueError("Either 'basis' or 'path_folder' must be provided.")
         
-    def set_magic_sensors(self, sensors: FunctionsList = None, path_folder: str = None, **kwargs):
+    def set_magic_points(self, magic_points: dict = None, path_folder: str = None):
         """
-        Assign the magic sensors to the GEIM model either from a FunctionsList object or by loading from a folder.
+        Set the magic points for the EIM.
 
         Parameters
         ----------
-        sensors : FunctionsList, optional
-            An instance of `FunctionsList` containing the sensor functions.
-        path_folder : str, optional
-            The path to the folder containing the sensor functions.
-        **kwargs : dict
-            Additional keyword arguments to pass to the loading function.
-
-        Returns
-        -------
-        None
-
+        magic_points : list of int
+            A list containing the indices of the magic points.
         """
-
-        if sensors is not None:
-            self.sensors = OnlineSensors(library=sensors, gdim=self.gdim, grid=self.grid)
+        if magic_points is not None:
+            self.magic_points = magic_points
         elif path_folder is not None:
-            _filename = os.path.join(path_folder, f'ms_{self.varname}')
-            self.sensors = OnlineSensors(library=ImportFunctionsList(_filename, **kwargs), gdim=self.gdim, grid=self.grid)
+            _filename = os.path.join(path_folder, f'magic_points_{self.varname}.npy')
+            self.magic_points = np.load(_filename, allow_pickle=True).item()
         else:
-            raise ValueError("Either 'sensors' or 'path_folder' must be provided.")
-        
+            raise ValueError("Either 'magic_points' or 'path_folder' must be provided.")
+
     def compute_B_matrix(self):
         r"""
 
-        Compute the matrix B used in the GEIM: this matrix is the evaluation of the magic functions at the magic sensors.
+        Compute the matrix B used in the EIM: this matrix is the evluation of the magic functions at the magic points.
 
         .. math::
-            B_{ij} = v_i(q_j) \qquad i,j = 1, \ldots, M
+            B_{ij} = q_j(x_i) \qquad i,j = 1, \ldots, M
 
-        where :math:`\{q_j\}_{j=1}^M` are the magic functions and :math:`\{v_i\}_{i=1}^M` are the magic sensors.
+        where :math:`\{q_j\}_{j=1}^M` are the magic functions and :math:`\{x_i\}_{i=1}^M` are the magic points.
     
         """
 
-        M = len(self.sensors._library)
+        M = len(self.magic_points['idx'])
 
-        assert M == len(self._basis), f"Number of magic sensors {M} must be equal to the number of magic functions {len(self._basis)}."
+        assert M == len(self._basis), f"Number of magic points {M} must be equal to the number of magic functions {len(self._basis)}."
 
-        self.matrix_B = self.sensors.action(self._basis)
+        self.matrix_B = self._basis.return_matrix()[self.magic_points['idx']]
         
     def set_tikhonov_matrices(self, beta_coeffs: np.ndarray = None, train_snaps: FunctionsList | np.ndarray = None):
         r"""
@@ -156,18 +146,17 @@ class GEIM(OnlineDDROM):
         # Compute Tikhonov matrix
         self.tikhonov['T'] = np.diag(1.0 / (self.tikhonov['beta_std'] + 1e-16)) # shape (M, M)
 
-
     def get_measurements(self, snaps: FunctionsList | np.ndarray, M: int = None,
                          noise_std: float = 0.0):
         r"""
-        This method extracts the measures from the input functions at the magic sensors locations.
+        This method extracts the measures from the input functions at the magic points locations.
 
         Parameters
         ----------
         snaps : FunctionsList or np.ndarray
             Function object to extract the measures from.
         M : int, optional (Default = None)
-            Number of sensors to use for the extraction. If `None`, all available magic sensors are used.
+            Number of magic points to use for the extraction. If `None`, all available magic points are used.
         noise_std : float, optional (Default = 0.0)
             Standard deviation of the Gaussian noise to be added to the measurements. Default is 0.
             
@@ -187,7 +176,7 @@ class GEIM(OnlineDDROM):
 
         assert snaps.shape[0] == self._basis.fun_shape, "Input shape must match the magic functions shape."
 
-        measures = self.sensors.action(snaps, M=M) # shape (M, Ns)
+        measures = snaps[self.magic_points['idx'][:M]]
 
         if noise_std > 0.0:
             noise = np.random.normal(0, noise_std, measures.shape)
@@ -225,17 +214,12 @@ class GEIM(OnlineDDROM):
 
         return estimation
     
-    def _solve_geim_linear_system(self, measures: np.ndarray):
+    def _solve_eim_linear_system(self, measures: np.ndarray):
         r"""
-        Computes the reduced coefficients :math:`\{\beta_m\}_{m=1}^{M}}` with as many magic functions/points (synthetic) as the input measures :math:`M`
+        Computes the reduced coefficients :math:`\{\beta_m\}_{m=1}^{M}}` with as many magic functions/points (synthetic) as the input measures :math:`M`.
         
         .. math::
             y_m = u(\vec{x}_m) \qquad m = 1, \dots, M_{max}
-
-        from the following linear system
-
-        .. math::
-            \mathbb{B}\boldsymbol{\beta} = \mathbf{y}
         
         Parameters
         ----------
@@ -258,7 +242,7 @@ class GEIM(OnlineDDROM):
 
         return beta_coeff
     
-    def _solve_trgeim_linear_system(self, measures: np.ndarray, regularization_params: dict):
+    def _solve_treim_linear_system(self, measures: np.ndarray, regularization_params: dict):
         r"""
         Computes the reduced coefficients :math:`\{\beta_m\}_{m=1}^{M}}` with as many magic functions/points (synthetic) as the input measures :math:`M`
         
@@ -309,44 +293,51 @@ class GEIM(OnlineDDROM):
 
         return beta_coeff
     
-    def estimate(self, measures: np.ndarray,
+    def estimate(self, measures: np.ndarray, M: int = None,
                  regularization_params: dict = None):
         r"""
-        Estimate the state using the GEIM given the measures at the sensor locations.
+        Estimate the state using the EIM given the measures at the magic points locations.
 
         Parameters
         ----------
         measures : np.ndarray
             Measures :math:`\{y_m\}_{m=1}^{M_{max}}`, shaped :math:`(M_{max},N_s)`.
+        M : int, optional (Default = None)
+            Number of magic points to use for the extraction. If `None`, all available magic points are used.
         regularization_params : dict, optional (Default = None)
             Dictionary containing the regularization parameters. If `None`, no regularization is applied.
             At the moment, the only supported regularization is Tikhonov from `Introini et al. (2023) <https://doi.org/10.1016/j.cma.2022.115773>`_.
-            
+        
         Returns
         -------
         estimation : FunctionsList
             An instance of `FunctionsList` containing the estimated state.
         """
 
-        assert measures.shape[0] <= len(self.sensors), f"The number of measures {measures.shape[0]} must be less than or equal to the number of magic sensors {len(self.sensors)}."
+        if M is None:
+            M = len(self.magic_points['idx'])
+        else:
+            assert M <= len(self.magic_points['idx']), "M cannot be larger than the number of magic points available"
+
+        assert measures.shape[0] <= M, f"The number of measures {measures.shape[0]} must be less than or equal to the number of magic points {M}."
 
         if self.matrix_B is None:
             self.compute_B_matrix()
 
         if regularization_params is not None:
             if regularization_params['type'] == 'tikhonov':
-                beta_coeff = self._solve_trgeim_linear_system(measures, regularization_params)
+                beta_coeff = self._solve_treim_linear_system(measures, regularization_params)
             else:
                 raise ValueError(f"Regularization type {regularization_params['type']} not recognized: available types: 'tikhonov'.")
         else:
-            beta_coeff = self._solve_geim_linear_system(measures)
+            beta_coeff = self._solve_eim_linear_system(measures)
         estimation = self._reconstruct(beta_coeff)
 
         return estimation
         
     def _reduce(self, snaps: FunctionsList | np.ndarray, M: int = None):
         r"""
-        This method can be used to generate the reduced coefficients based on the magic functions and points, by extracting the measures from the input functions and solve the associated GEIM linear system.
+        This method can be used to generate the reduced coefficients based on the magic functions and points, by extracting the measures from the input functions and solve the associated EIM linear system.
 
         Parameters
         ----------
@@ -381,9 +372,9 @@ class GEIM(OnlineDDROM):
             self.compute_B_matrix()
 
         measures = self.get_measurements(snaps, M)
-        return self._solve_geim_linear_system(measures)
+        return self._solve_eim_linear_system(measures)
 
-    def compute_errors(self, snaps: FunctionsList | np.ndarray, Mmax: int = None,
+    def compute_errors(self, snaps: FunctionsList | np.ndarray, Mmax: int = None, 
                        noise_std: float = 0.0, regularization_params: dict = None,
                        verbose: bool = False):
         r"""
@@ -474,7 +465,7 @@ class GEIM(OnlineDDROM):
             computational_time['Measures'][:, mm] = timer.stop()
 
             timer.start()
-            reconstructed_snaps = self.estimate(_measures, regularization_params=regularization_params)
+            reconstructed_snaps = self.estimate(_measures, M=mm+1, regularization_params=regularization_params)
             computational_time['StateEstimation'][:, mm] = timer.stop()
 
             for mu_i in range(Ns):

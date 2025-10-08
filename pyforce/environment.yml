@@ -3,19 +3,16 @@ channels:
   - conda-forge
 dependencies:
   - python=3.10
-  - numpy
-  - scipy
-  - matplotlib
-  - pyvista
-  - fenics-dolfinx=0.6.0
-  - mpi4py
-  - petsc4py
-  - h5py
+  - IPykernel
   - pip
   - pip:
+    - numpy
+    - scipy
+    - matplotlib
+    - pyvista
+    - h5py
     - tqdm
-    - gmsh
-    - gmsh-api
     - fluidfoam
+    - trame-vtk
     - scikit-learn
-    - setuptools==63.0.0
+    - setuptools>=63.0.0

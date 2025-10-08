@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyforce"
+version = "1.0.0"
+description = "Python Framework data-driven model Order Reduction for multi-physiCs problEms"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Stefano Riva", email = "stefano.riva@polimi.it" },
+    { name = "Carolina Introini", email = "carolina.introini@polimi.it" },
+    { name = "Antonio Cammi", email = "antonio.cammi@polimi.it" }
+]
+keywords = ["reduced-order-modelling", "data-assimilation", "dolfinx"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Mathematics"
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pyvista",
+    "h5py",
+    "ipykernel",
+    "tqdm",
+    "fluidfoam",
+    "trame-vtk",
+    "scikit-learn",
+    "setuptools>=63.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/ROSE-Polimi/pyforce"
+
+[tool.setuptools.packages.find]
+exclude = ["tests"]

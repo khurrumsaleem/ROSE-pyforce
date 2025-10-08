@@ -1,542 +1,686 @@
-# Offline Phase: Proper Orthogonal Decomposition
+# Offline Phase: Singular Value Decomposition and Proper Orthogonal Decomposition
 # Author: Stefano Riva, PhD Student, NRG, Politecnico di Milano
-# Latest Code Update: 09 September 2024
-# Latest Doc  Update: 24 May 2024
+# Latest Code Update: 07 October 2025
+# Latest Doc  Update: 07 October 2025
 
 import numpy as np
 import scipy
-import warnings
-
-from dolfinx.fem import (Function, FunctionSpace)
+import pyvista as pv
+import matplotlib.pyplot as plt
 from sklearn.utils.extmath import randomized_svd
+from collections import namedtuple
+import os
 
-from pyforce.tools.backends import norms, LoopProgress
-from pyforce.tools.functions_list import *
+from ..tools.functions_list import FunctionsList
+from ..tools.backends import IntegralCalculator, LoopProgress, Timer
+from .offline_base import OfflineDDROM
 
-class POD():
-  r"""
-    A class to perform the POD on a list of snapshots :math:`u(\mathbf{x};\,\boldsymbol{\mu})` dependent on some parameter :math:`\boldsymbol{\mu}\in\mathcal{P}\subset\mathbb{R}^p`. 
-    This class is used for `FunctionsList`, the POD modes are obtained from the eigendecomposition of the correlation matrix :math:`C\in\mathbb{R}^{N_s\times N_s}`
-    
-    .. math::
-        C_{ij} = \left(u(\cdot;\,\boldsymbol{\mu}_i),\,u(\cdot;\,\boldsymbol{\mu}_j)\right)_{L^2}\qquad i,j = 1, \dots, N_s
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn.utils.extmath")
 
-    .. math::
-        C \boldsymbol{\eta_n} = \lambda_n \boldsymbol{\eta_n}\qquad\qquad\qquad n = 1, \dots, N_s
-    
-    The eigenvalues :math:`\lambda_n` and eigenvectors :math:`\boldsymbol{\eta_n}` are immediately computed.
-
-    Parameters
-    ----------
-    train_snap : FunctionsList
-      List of snapshots onto which the POD is performed.
-    name : str
-      Name of the field.
-    verbose : boolean, optional (Default = False) 
-      If `True`, print of the progress is enabled.
-
-    """
-  def __init__(self, train_snap: FunctionsList, name: str, 
-               svd_acceleration_rank: int = None,
-               use_scipy=False, verbose = False) -> None:
-
-    self.Ns   = len(train_snap)
-    self.V = train_snap.fun_space
-    self.norm = norms(self.V)
-    self.name = name
-
-    # Generate the correlation matrix using inner product in L^2
-    if svd_acceleration_rank is not None:
-      _svd_u, _svd_s, _ = randomized_svd(train_snap.return_matrix(), n_components=svd_acceleration_rank, n_iter='auto')
-
-      # Compute the residual energy and check if the rank is too low or too high
-      residual_energy = np.sum(_svd_s[:-1]**2) / np.sum(_svd_s**2)
-      if residual_energy <= 0.99:
-          print("Warning: The residual energy of the SVD is {} <= 0.9 for rank {}. This may indicate that the rank is too low.".format(residual_energy, svd_acceleration_rank))
-          
-      _svd_v = _svd_u.T @ train_snap.return_matrix() # shape (svd_acceleration_rank, Ns)
-
-      # Compute the matrix for L2 inner product
-      _P_matrix = np.zeros((svd_acceleration_rank, svd_acceleration_rank))
-
-      if verbose:
-          progressBar = LoopProgress(msg = "Computing " + self.name + ' correlation matrix', final = svd_acceleration_rank)
-
-      for ii in range(svd_acceleration_rank):
-        for jj in range(svd_acceleration_rank):
-          if jj >= ii:
-            _P_matrix[ii, jj] = self.norm.L2innerProd(_svd_u[:, ii], _svd_u[:, jj])
-          else:
-            _P_matrix[ii, jj] = _P_matrix[jj, ii]
-        progressBar.update(1, percentage = False)
-
-      # Compute the correlation matrix using the SVD
-      corrMatrix = _svd_v.T @ _P_matrix @ _svd_v
-      assert corrMatrix.shape == (self.Ns, self.Ns), "The correlation matrix has the wrong shape: {}".format(corrMatrix.shape)
-    
-    else:
-
-      if verbose:
-          progressBar = LoopProgress(msg = "Computing " + self.name + ' correlation matrix', final = self.Ns)
-
-      corrMatrix = np.zeros((self.Ns, self.Ns))
-      for ii in range(self.Ns):
-          for jj in range(self.Ns):
-              if jj>=ii:
-                  corrMatrix[ii,jj] = self.norm.L2innerProd(train_snap(ii), train_snap(jj))
-              else:
-                  corrMatrix[ii,jj] = corrMatrix[jj,ii]
-
-          if verbose:
-              progressBar.update(1, percentage = False)
-
-    # Solving the eigenvalue problem and sorting the eigenvalue/eigenvector pairs
-    if use_scipy:
-      eigenvalues, eigenvectors = scipy.linalg.eigh(corrMatrix, subset_by_value=[0,np.inf])
-    else:    
-      eigenvalues, eigenvectors = np.linalg.eigh(corrMatrix) 
-    sorted_indexes = np.argsort( eigenvalues * (-1.) )
-    eigenvalues = eigenvalues[sorted_indexes]
-    eigenvectors = eigenvectors[:,sorted_indexes]
-
-    # Store the eigenvalue/eigenvector pairs
-    self.eigenvalues  = eigenvalues
-    self.eigenvectors = eigenvectors
-
-  def GramSchmidt(self, fun: Function) -> np.ndarray:
+class rSVD(OfflineDDROM):
     r"""
-    Perform a step of the Gram-Schmidt process on POD modes :math:`\{\psi_k\}_{k=1}^r` adding `fun` :math:`=f` to enforce the orthonormality in :math:`L^2`
-
-    .. math::
-      \psi_{r+1} = f - \sum_{k=1}^r \frac{(f, \psi_k)_{L^2}}{(\psi_k, \psi_k)_{L^2}}\psi_k
+    A class to perform randomized Singular Value Decomposition (rSVD) on a list of snapshots :math:`u(\mathbf{x};\,\boldsymbol{\mu})` dependent on some parameter :math:`\boldsymbol{\mu}\in\mathcal{P}\subset\mathbb{R}^p`.
 
     Parameters
     ----------
-    fun : Function
-      Function to add to the POD basis.
+    grid : pyvista.UnstructuredGrid
+        The grid on which the rSVD is performed. It is used to define the spatial domain of the snapshots.
+    gdim : int, optional (Default = 3)
+        The geometric dimension of the grid. It can be either 2 or 3.
+    varname : str, optional (default='u')
+        The name of the variable to be used for the rSVD. Default is 'u'.
 
-    Returns
-    -------
-    normalised_fun : Function
-      Orthonormalised function :math:`\psi_{r+1}` with respect to the POD basis :math:`\{\psi_k\}_{k=1}^r`.
     """
-    ii = len(self.PODmodes)
+
+    def fit(self, train_snaps: FunctionsList, rank: int, verbose: bool=False, **kwargs):
+        r"""
+        This method is used to perform the randomized SVD on the training snapshots.
+
+        Parameters
+        ----------
+        train_snaps : FunctionsList
+            The training snapshots used to compute the rSVD modes.
+        rank : int
+            The rank for the truncated SVD.
+        verbose : bool, optional
+            If True, print progress messages. Default is False.
+        kwargs : dict, optional
+            Additional keyword arguments for the SVD solver.
+        """
+
+        Ns = len(train_snaps)
+
+        if verbose:
+            print('Computing ' + self.varname + ' SVD', end='\r')
+
+        _time = Timer()
+        _time.start()
+
+        _U, _S, _ = randomized_svd(train_snaps.return_matrix(), n_components=rank, **kwargs)
+
+        self.singular_values = _S
+        self.svd_modes = FunctionsList(train_snaps.fun_shape)
+        self.svd_modes.build_from_matrix(_U)
+
+        elapsed_time = _time.stop()
+        if verbose:
+            print(f"SVD of {self.varname} snapshots calculated in {elapsed_time:.6f} seconds (cpu).")
+
+    def plot_sing_vals(self):
+        """
+        Simple method to plot the eigenvalues of the POD modes: in linear scale, residual and cumulative energy.
+
+        Returns 
+        -------
+        fig : matplotlib.figure.Figure
+            The figure containing the plots of the eigenvalues, residual energy, and cumulative energy.
+
+        """
+
+        fontsize = 17
+
+        fig, axs = plt.subplots(1, 3, figsize=(16, 4), sharex=True)
+
+        _Nplot = np.arange(1, len(self.singular_values)+1)
+
+        axs[0].plot(_Nplot, self.singular_values, 'r', label='Singular Values')
+        axs[0].set_ylabel(r'Singular Values: $\sigma_r$', fontsize=fontsize)
+
+        axs[1].semilogy(_Nplot[:-1], 1 - np.cumsum(self.singular_values[:-1]**2) / np.sum(self.singular_values**2), 'b', label='Cumulative residual energy')
+        axs[1].set_ylabel(r'Residual energy: $1 - \frac{\sum_{k=1}^r \sigma_k^2}{\sum_{n=1}^{r_{max}} \sigma_n^2}$', fontsize=fontsize)
+
+        axs[2].plot(_Nplot, np.cumsum(self.singular_values**2) / np.sum(self.singular_values**2), 'g', label='Cumulative energy')
+        axs[2].set_ylabel(r'Cumulative energy: $\frac{\sum_{k=1}^r \sigma_k^2}{\sum_{n=1}^{N_s} \sigma_n^2}$', fontsize=fontsize)
+
+        for ax in axs:
+            ax.set_xlabel(r'Rank $r$', fontsize=fontsize)
+            ax.grid(which='both', linestyle='--', linewidth=0.5)
+            ax.tick_params(axis='both', which='major', labelsize=fontsize-2)
+
+        fig.suptitle(f'Singular Values - {self.varname}', y=1.02, fontsize=fontsize+3)
+        plt.tight_layout()
+
+        return fig
     
-    # Defining the summation term
-    _rescaling = list()
-    for jj in range(ii+1):
-        if jj < ii:
-          _rescaling.append( self.norm.L2innerProd(fun, self.PODmodes(jj)) / self.norm.L2innerProd(self.PODmodes(jj), self.PODmodes(jj)) * self.PODmodes(jj) )
-    
-    # Computing the normalised function
-    normalised_fun = fun - sum(_rescaling)
-    return normalised_fun / self.norm.L2norm(normalised_fun)
-  
-    # Deprecated?  
-    # for jj in range(ii+1):
-    #     if jj < ii:
-    #         fun.vector.axpy(- self.norm.L2innerProd(fun, self.PODmodes(jj)) / self.norm.L2innerProd(self.PODmodes(jj), self.PODmodes(jj)),
-    #                                                 self.PODmodes.map(jj).vector)
+    def _project(self, u: np.ndarray, N: int):
+        r"""
+        Projects the function `u` onto the first `N` SVD modes to obtain the reduced coefficients :math:`\{\alpha_k\}_{k=1}^N`.
+
+        The projection is done using the inner product in :math:`l_2` (euclidean product).
+
+        Parameters
+        ----------
+        u : np.ndarray
+            Function object to project onto the reduced space of dimension `N`.
+        N : int
+            Dimension of the reduced space, modes to be used.
+        
+        Returns
+        -------
+        coeffs : np.ndarray
+            Modal SVD coefficients of `u`, :math:`\{\alpha_k\}_{k=1}^N`.
+        
+        """
+
+        coeffs = self.svd_modes.return_matrix()[:, :N].T @ u
+
+        return coeffs
+
+    def reduce(self, snaps: FunctionsList | np.ndarray, N: int = None):
+        r"""
+        The reduced coefficients :math:`\{\alpha_k\}_{k=1}^N` of the snapshots using `N` modes :math:`\{\psi_k\}_{k=1}^N` are computed using projection in :math:`l_2`.
+        
+        Parameters
+        ----------
+        snaps : FunctionsList or np.ndarray
+            Function object to project onto the reduced space of dimension `N`.
+        N : int
+            Dimension of the reduced space, modes to be used.
+        
+        Returns
+        -------
+        coeff : np.ndarray
+            Modal SVD coefficients of `u`, :math:`\{\alpha_k\}_{k=1}^N`.
+        """
+
+        if N is None:
+            N = len(self.svd_modes)
+        else:
+            assert N <= len(self.svd_modes), "N must be less than or equal to the number of SVD modes."
+
+        if isinstance(snaps, FunctionsList):
+            snaps = snaps.return_matrix()
+        elif isinstance(snaps, np.ndarray):
+            if snaps.ndim == 1:
+                snaps = np.atleast_2d(snaps).T # shape (Nh, 1)
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+
+        assert snaps.shape[0] == self.svd_modes.fun_shape, "Input shape must match the SVD modes shape."
+
+        coeffs = np.zeros((N, snaps.shape[1]))
+
+        for nn in range(coeffs.shape[1]):
+            coeffs[:, nn] = self._project(snaps[:, nn], N)
+
+        return coeffs
+
+    def reconstruct(self, coeffs: np.ndarray):
+        r"""
+        This method reconstructs the function `u` from the reduced coefficients :math:`\{\alpha_k\}_{k=1}^N` using the POD modes :math:`\{\psi_k\}_{k=1}^N`.
+
+        .. math::
+            u(\cdot;\,\boldsymbol{\mu}) = \sum_{k=1}^N \alpha_k(\boldsymbol{\mu}) \psi_k(\cdot)
+
+
+        Parameters
+        ----------
+        coeffs : np.ndarray
+            Reduced coefficients :math:`\{\alpha_k\}_{k=1}^N`, shaped :math:`(N,N_s)`.
+
+        Returns
+        -------
+        u : FunctionsList
+            Reconstructed functions.
+        """
+
+        assert coeffs.shape[0] <= len(self.svd_modes), "The number of coefficients must be less than or equal to the number of POD modes."
+        coeffs = np.atleast_2d(coeffs)
+
+        reconstructed_snaps = FunctionsList(self.svd_modes.fun_shape)
+
+        for nn in range(coeffs.shape[1]):
+            reconstructed_snaps.append(
+                self.svd_modes.lin_combine(coeffs[:, nn])
+            )
+
+        return reconstructed_snaps
+
+    def compute_errors(self, snaps: FunctionsList | np.ndarray, Nmax: int = None, verbose: bool = False):
+        r"""
+        Computes the errors between the original snapshots and the reconstructed ones.
+
+        Parameters
+        ----------
+        snaps : FunctionsList or np.ndarray
+            Original snapshots to compare with.
+        Nmax : int, optional
+            Maximum number of modes to use for the reconstruction. If None, all modes are used. 
+        verbose : bool, optional
+            If True, print progress messages. Default is False.
+
+        Returns
+        ----------
+        mean_abs_err : np.ndarray
+            Average absolute error measured in :math:`L^2`.
+        mean_rel_err : np.ndarray
+            Average relative error measured in :math:`L^2`.
+        computational_time : dict
+            Dictionary with the CPU time of the most relevant operations during the online phase.
+
+        """
+
+        if isinstance(snaps, FunctionsList):
+            Ns = len(snaps)
+            assert snaps.fun_shape == self.svd_modes.fun_shape, "The shape of the snapshots must match the shape of the SVD modes."
+
+            # Convert FunctionsList to numpy array for processing
+            snaps = snaps.return_matrix()
+
+        elif isinstance(snaps, np.ndarray):
+            Ns = snaps.shape[1]
+            assert snaps.shape[0] == self.svd_modes.fun_shape, "The shape of the snapshots must match the shape of the SVD modes."
+
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+        
+        if Nmax is None:
+            Nmax = len(self.svd_modes)
+        else:
+            assert Nmax <= len(self.svd_modes), f"Nmax={Nmax} must be less than or equal to the number of SVD modes, {len(self.svd_modes)}."
+
+        abs_err = np.zeros((Ns, Nmax))
+        rel_err = np.zeros((Ns, Nmax))
+
+        # Variables to store computational time
+        computational_time = dict()
+        computational_time['StateEstimation'] = np.zeros((Ns, Nmax))
+        computational_time['Errors']          = np.zeros((Ns, Nmax))
+
+        timer = Timer()
+
+        if verbose:
+            print(f"Computing L2 norm of snapshot", end='\r')
+
+        _snap_norm = list()
+        for mu_i in range(Ns):
+
+            timer.start()
+            _snap_norm.append(
+                self.calculator.L2_norm(snaps[:, mu_i])
+            )
             
-    # return fun.x.array[:]  / self.norm.L2norm(fun)
-  
-  def mode(self, train_snap: FunctionsList, r: int) -> Function:
-    r"""
-    Computes the `r`-th POD mode, according to the following formula
-    
-    .. math::
-      \psi_{r} (\mathbf{x})= \frac{1}{\lambda_r}\sum_{i=1}^{N_s} \eta_{r, i}\,u(\mathbf{x};\,\boldsymbol{\mu}_i)
-
-    Parameters
-    ----------
-    train_snap : FunctionsList
-      List of snapshots onto which the POD is performed.
-    r : int
-      Integer input indicating the mode to define.
-
-    """
-    return train_snap.lin_combine(self.eigenvectors[:,r] / np.sqrt(self.eigenvalues[r]))
-
-  def compute_basis(self, train_snap: FunctionsList, maxBasis: int, normalise = False) -> None:
-    r"""
-    Computes the POD modes.
-    
-    To enforce the orthonormality in :math:`L^2`, the Gram-Schmidt procedure can be used, if the number of modes to be used is high the numerical error in the eigendecomposition may be too large and the orthonormality is lost.
-
-    Parameters
-    ----------
-    train_snap : FunctionsList
-      List of snapshots onto which the POD is performed.
-    maxBasis : int
-      Integer input indicating the number of modes to define.
-    normalise : boolean, optional (Default = False)
-      If True, the Gram-Schmidt procedure is used to normalise the POD modes.
-
-    """
-    self.PODmodes = FunctionsList(self.V)
-
-    for rankII in range(maxBasis):
-      if normalise:
-        self.PODmodes.append(self.GramSchmidt(self.mode(train_snap, rankII)))
-      else:
-       self.PODmodes.append(self.mode(train_snap, rankII))
-       
-  def projection(self, u: Function, N: int) -> np.ndarray:
-    r"""
-    The reduced coefficients :math:`\{\alpha_k\}_{k=1}^N` of `u` using `N` modes :math:`\{\psi_k\}_{k=1}^N` are computed using projection in :math:`L_2`, i.e.
-
-    .. math::
-      \alpha_k(\boldsymbol{\mu}) = (u(\cdot;\,\boldsymbol{\mu}), \,\psi_k)_{L^2}\qquad k = 1, \dots, N
-    
-    Parameters
-    ----------
-    u : Function 
-      Function object to project onto the reduced space of dimension `N`.
-    N : int
-      Dimension of the reduced space, modes to be used.
-    
-    Returns
-    -------
-    coeff : np.ndarray
-      Modal POD coefficients of `u`, :math:`\{\alpha_k\}_{k=1}^N`.
-    """
-
-    # The coefficients are computed using projection in L^2
-    coeff = np.zeros((N,))
-    for ii in range(N):
-      coeff[ii] = self.norm.L2innerProd(u, self.PODmodes(ii)) 
-
-    return coeff
-
-  def train_error(self, train_snap: FunctionsList, maxBasis: int, verbose : bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""
-    The maximum absolute :math:`E_N` and relative :math:`\varepsilon_N` error on the train set is computed, by projecting it onto the reduced space in :math:`L^2`-sense
-
-    .. math::
-      E_N = \max\limits_{\boldsymbol{\mu}\in\Xi_{\text{train}}} \left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{L^2}
-    .. math::
-      \varepsilon_N = \max\limits_{\boldsymbol{\mu}\in\Xi_{\text{train}}} \frac{\left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{L^2}}{\left\| u(\mathbf{x};\,\boldsymbol{\mu})\right\|_{L^2}}
-    
-    Parameters
-    ----------
-    train_snap : FunctionsList
-      List of snapshots onto which the train error of the POD basis is performed.
-    maxBasis : int
-      Integer input indicating the maximum number of modes to use.
-    verbose : boolean, optional (Default = False) 
-      If `True`, print of the progress is enabled.
-
-    Returns
-    -------
-    maxAbsErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-    maxRelErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-    coeff_matrix : np.ndarray 
-      Matrix of the modal coefficients, obtained by projection in :math:`L^2`.
-    """
-    
-    absErr = np.zeros((self.Ns, maxBasis))
-    relErr = np.zeros_like(absErr)
-    coeff_matrix = np.zeros_like(absErr)
-
-    if verbose:
-        progressBar = LoopProgress(msg = "Computing train error " + self.name, final = self.Ns)
-
-    resid = Function(self.V).copy()
-    for mu in range(self.Ns):
+            computational_time['Errors'][mu_i, :] = timer.stop()
         
-        # Projecting the snapshots onto the reduced space
-        coeff = self.projection(train_snap.map(mu), maxBasis)
+        if verbose: 
+            progressBar = LoopProgress(msg = f"Computing errors (SVD-projection) - {self.varname}", final = Nmax)
 
-        for M in range(maxBasis):
-          
-            # building residual field
-            resid.x.array[:] = train_snap(mu) - self.PODmodes.lin_combine(coeff[:M+1])
-            absErr[mu,M] = self.norm.L2norm(resid)
-            relErr[mu,M] = absErr[mu,M] / self.norm.L2norm(train_snap(mu))
+        for nn in range(Nmax):
 
-        coeff_matrix[mu, :] = coeff[:]
+            if verbose: 
+                progressBar.update(1, percentage = False)
+
+            timer.start()
+            _coeffs = self.reduce(snaps, nn+1) # shape (N, Ns)
+            reconstructed_snaps = self.reconstruct(_coeffs)
+            computational_time['StateEstimation'][:, nn] = timer.stop()
+
+            for mu_i in range(Ns):
+                timer.start()
+                _resid = snaps[:, mu_i] - reconstructed_snaps(mu_i)
+                abs_err[mu_i, nn] = self.calculator.L2_norm(_resid)
+                rel_err[mu_i, nn] = abs_err[mu_i, nn] / _snap_norm[mu_i]
+                computational_time['Errors'][mu_i, nn] += timer.stop()
+
+        Results = namedtuple('Results', ['mean_abs_err', 'mean_rel_err', 'computational_time'])
+        _res = Results(mean_abs_err = abs_err.mean(axis = 0), mean_rel_err = rel_err.mean(axis = 0), computational_time = computational_time)
+
+        return _res
+
+    def save(self, path_folder: str, **kwargs):
+        r"""
+        Save the SVD modes and the singular values to a specified path.
+
+        Parameters
+        ----------
+        path_folder : str
+            The folder path where the model will be saved.
+        **kwargs : dict
+            Additional keyword arguments for saving options.
+        """
+        
+        os.makedirs(path_folder, exist_ok=True)
+
+        # Save the SVD modes
+        self.svd_modes.store(f'SVDmode_{self.varname}', 
+                             filename=os.path.join(path_folder, f'SVDmode_{self.varname}'),
+                             **kwargs)
+        
+        np.save(os.path.join(path_folder, f'sing_vals_{self.varname}.npy'), self.singular_values)
+
+class POD(OfflineDDROM):
+    r"""
+    A class to perform the POD on a list of snapshots :math:`u(\mathbf{x};\,\boldsymbol{\mu})` dependent on some parameter :math:`\boldsymbol{\mu}\in\mathcal{P}\subset\mathbb{R}^p`. 
+    
+    Parameters
+    ----------
+    grid : pyvista.UnstructuredGrid
+        The grid on which the POD is performed. It is used to define the spatial domain of the snapshots.
+    gdim : int, optional (Default = 3)
+        The geometric dimension of the grid. It can be either 2 or 3.
+    varname : str, optional
+        The name of the variable to be used for the POD. Default is 'u'.
+
+    """
+    
+    def fit(self, train_snaps: FunctionsList, verbose: bool=False):
+        r"""
+        This method is used to obtain the eigendecomposition of the correlation matrix :math:`C\in\mathbb{R}^{N_s\times N_s}` from a list of snapshots as `FunctionsList`.
+        
+        .. math::
+            C_{ij} = \left(u(\cdot;\,\boldsymbol{\mu}_i),\,u(\cdot;\,\boldsymbol{\mu}_j)\right)_{L^2}\qquad i,j = 1, \dots, N_s
+
+        .. math::
+            C \boldsymbol{\eta_n} = \lambda_n \boldsymbol{\eta_n}\qquad\qquad\qquad n = 1, \dots, N_s
+        
+        The eigenvalues :math:`\lambda_n` and eigenvectors :math:`\boldsymbol{\eta_n}` are then computed.
+        
+        Parameters
+        ----------
+        train_snaps : FunctionsList
+            The training snapshots used to compute the POD modes.
+        verbose : bool, optional
+            If True, print progress messages. Default is False.
+        """
+
+        Ns = len(train_snaps)
+
+        # Calculate the correlation matrix
+        if verbose: 
+            progressBar = LoopProgress(msg = "Computing " + self.varname + ' correlation matrix', final = Ns)
+
+        _time = Timer()
+        _time.start()
+        
+        corr_matr = np.zeros((Ns, Ns))
+
+        for ii in range(Ns):
+            for jj in range(ii, Ns):
+                corr_matr[ii, jj] = self.calculator.L2_inner_product(train_snaps(ii), train_snaps(jj))
+                corr_matr[jj, ii] = corr_matr[ii, jj]
+                
+            if verbose: 
+                progressBar.update(1, percentage = False)
+
+        eigenvalues, eigenvectors = scipy.linalg.eigh(corr_matr, subset_by_value=[0,np.inf])
+
+        # Sort eigenvalues and eigenvectors in descending order
+        sorted_indexes = np.argsort(eigenvalues)[::-1]
+        self.eigenvalues = eigenvalues[sorted_indexes]
+        self.eigenvectors = eigenvectors[:, sorted_indexes]
+
+        elapsed_time = _time.stop()
         if verbose:
-            progressBar.update(1, percentage = False)
+            print(f"Eigenvalues calculated in {elapsed_time:.6f} seconds.")
 
-    return absErr.max(axis = 0), relErr.max(axis = 0), coeff_matrix
+    def plot_eigenvalues(self):
+        """
+        Simple method to plot the eigenvalues of the POD modes: in linear scale, residual and cumulative energy.
 
-  def test_error(self, test_snap: FunctionsList, maxBasis: int, verbose : bool = False):
-    r"""
-    The average absolute :math:`E_N` and relative :math:`\varepsilon_N` error on the test set is computed, by projecting it onto the reduced space in :math:`L^2`-sense
+        Returns 
+        -------
+        fig : matplotlib.figure.Figure
+            The figure containing the plots of the eigenvalues, residual energy, and cumulative energy.
 
-    .. math::
-      E_N = \left\langle \left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{L^2} \right\rangle_{\boldsymbol{\mu}\in\Xi_{\text{test}}}
-    .. math::
-      \varepsilon_N =\left\langle \frac{\left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{L^2}}{\left\| u(\mathbf{x};\,\boldsymbol{\mu})\right\|_{L^2}} \right\rangle_{\boldsymbol{\mu}\in\Xi_{\text{test}}}
+        """
+
+        fig, axs = plt.subplots(1, 3, figsize=(16, 4), sharex=True)
+
+        _Nplot = np.arange(1, len(self.eigenvalues)+1)
+
+        axs[0].plot(_Nplot, self.eigenvalues, 'r', label='Eigenvalues')
+        axs[0].set_ylabel(r'Eigenvalues $\lambda_r$')
+
+        axs[1].semilogy(_Nplot, 1 - np.cumsum(self.eigenvalues) / np.sum(self.eigenvalues), 'b', label='Cumulative residual energy')
+        axs[1].set_ylabel(r'Residual energy $1 - \frac{\sum_{k=1}^r \lambda_k}{\sum_{n=1}^{N_s} \lambda_n}$')
+
+        axs[2].plot(_Nplot, np.cumsum(self.eigenvalues) / np.sum(self.eigenvalues), 'g', label='Cumulative energy')
+        axs[2].set_ylabel(r'Cumulative energy $\frac{\sum_{k=1}^r \lambda_k}{\sum_{n=1}^{N_s} \lambda_n}$')
+
+        for ax in axs:
+            ax.set_xlabel(r'Rank $r$')
+            ax.grid(which='both', linestyle='--', linewidth=0.5)
+
+        plt.tight_layout()
+
+        return fig
     
-    Parameters
-    ----------
-    test_snap : FunctionsList
-      List of snapshots onto which the test error of the POD basis is performed.
-    maxBasis : int
-      Integer input indicating the maximum number of modes to use.
-    verbose : boolean, optional (Default = False) 
-      If `True`, print of the progress is enabled.
+    def gram_schmidt(self, fun: np.ndarray):
+        r"""
+        Perform a step of the Gram-Schmidt process on POD modes :math:`\{\psi_k\}_{k=1}^r` adding `fun` :math:`=f` to enforce the orthonormality in :math:`L^2`
 
-    Returns
-    -------
-    meanAbsErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-    maxRelErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-    coeff_matrix : np.ndarray 
-      Matrix of the modal coefficients, obtained by projection in :math:`L^2`.
-    """
+        .. math::
+            \psi_{r+1} = f - \sum_{k=1}^r \frac{(f, \psi_k)_{L^2}}{(\psi_k, \psi_k)_{L^2}}\psi_k
+
+        Parameters
+        ----------
+        fun : np.ndarray
+            Function to add to the POD basis.
+
+        Returns
+        -------
+        normalised_fun : np.ndarray
+            Orthonormalised function :math:`\psi_{r+1}` with respect to the POD basis :math:`\{\psi_k\}_{k=1}^r`.
+        """
+
+        ii = len(self.pod_modes)
+
+        # Defining the summation term
+        _rescaling = list()
+        for jj in range(ii+1):
+            if jj < ii:
+                _rescaling.append( 
+                    self.calculator.L2_inner_product(fun, self.pod_modes(jj)) / 
+                    self.calculator.L2_inner_product(self.pod_modes(jj), self.pod_modes(jj)) *
+                    self.pod_modes(jj)
+                )
+
+        # Computing the orthonormalised function
+        normalised_fun = fun - sum(_rescaling)
+        return normalised_fun / self.calculator.L2_norm(normalised_fun)
+
+    def compute_basis(self, train_snaps: FunctionsList, rank: int, normalise: bool = False):
+        r"""
+        Computes the POD modes.
+        
+        To enforce the orthonormality in :math:`L^2`, the Gram-Schmidt procedure can be used, if the number of modes to be used is high the numerical error in the eigendecomposition may be too large and the orthonormality is lost.
+
+        Parameters
+        ----------
+        train_snap : FunctionsList
+            List of snapshots onto which the POD is performed.
+        rank : int
+            Integer input indicating the number of modes to define.
+        normalise : boolean, optional (Default = False)
+            If True, the Gram-Schmidt procedure is used to normalise the POD modes.
+
+        """
+
+        self.pod_modes = FunctionsList(train_snaps.fun_shape)
+
+        for rr in range(rank):
+
+            _mode = train_snaps.lin_combine(self.eigenvectors[:,rr] / np.sqrt(self.eigenvalues[rr]))
+
+            if normalise:
+                # Perform Gram-Schmidt process to ensure orthonormality
+                self.pod_modes.append(
+                    self.gram_schmidt(_mode)
+                    )
+            else:
+                self.pod_modes.append(
+                    _mode
+                    )
     
-    Ns_test = len(test_snap)
-    absErr = np.zeros((Ns_test, maxBasis))
-    relErr = np.zeros_like(absErr)
-    coeff_matrix = np.zeros_like(absErr)
+    def _project(self, u: np.ndarray, N: int):
+        r"""
+        Projects the function `u` onto the first `N` POD modes to obtain the reduced coefficients :math:`\{\alpha_k\}_{k=1}^N`.
 
-    if verbose:
-        progressBar = LoopProgress(msg = "Computing POD test error (projection) - " + self.name, final = Ns_test)
+        The projection is done using the inner product in :math:`L_2`, i.e.
 
-    resid = Function(self.V).copy()
-    for mu in range(Ns_test):
-      
-        # Projecting the snapshots onto the reduced space
-        coeff = self.projection(test_snap.map(mu), maxBasis)
+        .. math::
+            \alpha_k(\boldsymbol{\mu}) = (u(\cdot;\,\boldsymbol{\mu}), \,\psi_k)_{L^2}\qquad k = 1, \dots, N
+        
+        Parameters
+        ----------
+        u : np.ndarray
+            Function object to project onto the reduced space of dimension `N`.
+        N : int
+            Dimension of the reduced space, modes to be used.
+        
+        Returns
+        -------
+        coeffs : np.ndarray
+            Modal POD coefficients of `u`, :math:`\{\alpha_k\}_{k=1}^N`.
+        
+        """
 
-        for M in range(maxBasis):
-            # building residual field
-            resid.x.array[:] = test_snap(mu) - self.PODmodes.lin_combine(coeff[:M+1])
-            absErr[mu,M] = self.norm.L2norm(resid)
-            relErr[mu,M] = absErr[mu,M] / self.norm.L2norm(test_snap(mu))
+        coeffs = np.zeros(N)
 
-        coeff_matrix[mu, :] = coeff[:]
+        for nn in range(N):
+            coeffs[nn] = self.calculator.L2_inner_product(u, self.pod_modes[nn])
+
+        return coeffs
+
+    def reduce(self, snaps: FunctionsList | np.ndarray, N: int = None):
+        r"""
+        The reduced coefficients :math:`\{\alpha_k\}_{k=1}^N` of the snapshots using `N` modes :math:`\{\psi_k\}_{k=1}^N` are computed using projection in :math:`L_2`.
+        
+        Parameters
+        ----------
+        snaps : FunctionsList or np.ndarray
+            Function object to project onto the reduced space of dimension `N`.
+        N : int
+            Dimension of the reduced space, modes to be used.
+        
+        Returns
+        -------
+        coeff : np.ndarray
+            Modal POD coefficients of `u`, :math:`\{\alpha_k\}_{k=1}^N`.
+        """
+
+        if N is None:
+            N = len(self.pod_modes)
+        else:
+            assert N <= len(self.pod_modes), "N must be less than or equal to the number of POD modes."
+
+        if isinstance(snaps, FunctionsList):
+            snaps = snaps.return_matrix()
+        elif isinstance(snaps, np.ndarray):
+            if snaps.ndim == 1:
+                snaps = np.atleast_2d(snaps).T # shape (Nh, 1)
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+        
+        assert snaps.shape[0] == self.pod_modes.fun_shape, "Input shape must match the POD modes shape."
+
+        coeffs = np.zeros((N, snaps.shape[1]))
+
+        for nn in range(coeffs.shape[1]):
+            coeffs[:, nn] = self._project(snaps[:, nn], N)
+
+        return coeffs
+
+    def reconstruct(self, coeffs: np.ndarray):
+        r"""
+        This method reconstructs the function `u` from the reduced coefficients :math:`\{\alpha_k\}_{k=1}^N` using the POD modes :math:`\{\psi_k\}_{k=1}^N`.
+
+        .. math::
+            u(\cdot;\,\boldsymbol{\mu}) = \sum_{k=1}^N \alpha_k(\boldsymbol{\mu}) \psi_k(\cdot)
+
+
+        Parameters
+        ----------
+        coeffs : np.ndarray
+            Reduced coefficients :math:`\{\alpha_k\}_{k=1}^N`, shaped :math:`(N,N_s)`.
+
+        Returns
+        -------
+        u : FunctionsList
+            Reconstructed functions.
+        """
+
+        assert coeffs.shape[0] <= len(self.pod_modes), "The number of coefficients must be less than or equal to the number of POD modes."
+        coeffs = np.atleast_2d(coeffs)
+
+        reconstructed_snaps = FunctionsList(self.pod_modes.fun_shape)
+
+        for nn in range(coeffs.shape[1]):
+            reconstructed_snaps.append(
+                self.pod_modes.lin_combine(coeffs[:, nn])
+            )
+
+        return reconstructed_snaps
+    
+    def compute_errors(self, snaps: FunctionsList | np.ndarray, Nmax: int = None, verbose: bool = False):
+        r"""
+        Computes the errors between the original snapshots and the reconstructed ones.
+
+        Parameters
+        ----------
+        snaps : FunctionsList or np.ndarray
+            Original snapshots to compare with.
+        Nmax : int, optional
+            Maximum number of modes to use for the reconstruction. If None, all modes are used. 
+        verbose : bool, optional
+            If True, print progress messages. Default is False.
+
+        Returns
+        ----------
+        mean_abs_err : np.ndarray
+            Average absolute error measured in :math:`L^2`.
+        mean_rel_err : np.ndarray
+            Average relative error measured in :math:`L^2`.
+        computational_time : dict
+            Dictionary with the CPU time of the most relevant operations during the online phase.
+
+        """
+
+        if isinstance(snaps, FunctionsList):
+            Ns = len(snaps)
+            assert snaps.fun_shape == self.pod_modes.fun_shape, "The shape of the snapshots must match the shape of the POD modes."
+
+            # Convert FunctionsList to numpy array for processing
+            snaps = snaps.return_matrix()
+
+        elif isinstance(snaps, np.ndarray):
+            Ns = snaps.shape[1]
+            assert snaps.shape[0] == self.pod_modes.fun_shape, "The shape of the snapshots must match the shape of the POD modes."
+
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+        
+        if Nmax is None:
+            Nmax = len(self.pod_modes)
+        else:
+            assert Nmax <= len(self.pod_modes), f"Nmax={Nmax} must be less than or equal to the number of POD modes, {len(self.pod_modes)}."
+
+        abs_err = np.zeros((Ns, Nmax))
+        rel_err = np.zeros((Ns, Nmax))
+
+        # Variables to store computational time
+        computational_time = dict()
+        computational_time['StateEstimation'] = np.zeros((Ns, Nmax))
+        computational_time['Errors']          = np.zeros((Ns, Nmax))
+
+        timer = Timer()
+
         if verbose:
-           progressBar.update(1, percentage = False)
+            print(f"Computing L2 norm of snapshot", end='\r')
 
-    meanAbsErr = absErr.mean(axis = 0)
-    meanRelErr = relErr.mean(axis = 0)
-    return meanAbsErr, meanRelErr, coeff_matrix
-  
+        _snap_norm = list()
+        for mu_i in range(Ns):
 
-# discete POD - the SVD of the full snapshot matrix is used
-class DiscretePOD():
-  r"""
-    A class to perform the POD on a list of snapshots :math:`u(\mathbf{x};\,\boldsymbol{\mu})` dependent on some parameter :math:`\boldsymbol{\mu}`. 
-    This class is used for several kind of inputs (`FunctionsList`, vectors, images, matrices...).
-
-    The snapshots are represented by a matrix :math:`\mathbb{S}\in\mathbb{R}^{\mathcal{N}_h\times N_s}`, such that
-
-    .. math::
-        \mathbb{S}_{ij} = u(\mathbf{x}_i;\,\boldsymbol{\mu}_j)
-    
-    in which the dependence on :math:`\mathbf{x}_i` can be a true spatial dependence or the dofs of a matrix/image.
-
-    The basis functions are computed using the `svd`, i.e.
-    
-    .. math::
-        \mathbb{U}, \Sigma, \mathbb{V}^\dagger = \text{svd}(\mathbb{S})
-
-    The basis functions are orthogonal in :math:`l_2` sense, hence the matrix containing the modes is orthogonal.
-
-    Parameters
-    ----------
-    train_snap : FunctionsMatrix or FunctionsList
-      List of snapshots onto which the POD is performed.
-    name : str
-      Name of the field.
-    Nmax : int, optional (default=None)
-      If `None` the full matrices are stored, else only the first `Nmax`.
-    random : bool, optional (default = False)
-      If True and if `Nmax` is provided, the randomised SVD is used.
-    """
-  def __init__(self, train_snap: FunctionsList, name: str, Nmax = None, random = False) -> None:
-
-    self.Ns = len(train_snap)
-    self.Nh = len(train_snap(0))
-    self.name = name
-    
-    self.modes = FunctionsList(dofs = train_snap.fun_shape)
-
-    # Performing SVD of the snapshot matrix
-    if random and Nmax is not None:
-      U, Sigma, V_T  = randomized_svd(train_snap.return_matrix(), n_components=Nmax, n_iter='auto')
-    else:
-      U, Sigma, V_T = np.linalg.svd(train_snap.return_matrix(), full_matrices=False)
-    if sum(Sigma < 0) > 0: 
-        warnings.warn("Check singular values: some of them are negative!")   
-
-    if Nmax is None:
-      self.Nmax = len(Sigma)
-    else:
-      self.Nmax = Nmax
-
-    self.sing_vals = Sigma[:self.Nmax]
-    self.Vh_train = V_T[:self.Nmax, :] # shape (Nmax, Ns)
-
-    # Computing POD basis
-    self.U = U
-    for rankII in range(self.Nmax):
-        self.modes.append(U[:, rankII]) # shape (Nh, Nmax)
+            timer.start()
+            _snap_norm.append(
+                self.calculator.L2_norm(snaps[:, mu_i])
+            )
+            
+            computational_time['Errors'][mu_i, :] = timer.stop()
         
-       
-  def projection(self, snap: np.ndarray, N: int = None):
-    r"""
-    The reduced coefficients :math:`\mathbf{V}^\dagger_\star\in\mathbb{R}^{N\times N_\star}` of `snap`:math:`=\mathbb{S}_\star\in\mathbb{R}^{\mathcal{N}_h\times N_\star}` using `N` modes :math:`\mathbb{U}\in\mathbb{R}^{\mathcal{N}_h\times N}` are computed using projection in :math:`l_2`, i.e.
+        if verbose: 
+            progressBar = LoopProgress(msg = f"Computing errors (POD-projection) - {self.varname}", final = Nmax)
 
-    .. math::
-      \mathbf{V}^\dagger_\star = \Sigma^{-1}\mathbb{U}^T\mathbb{S}_\star
-    
-    Parameters
-    ----------
-    snap : np.ndarray 
-      Matrix object to project onto the reduced space of dimension `N`. Must be :math:`(\mathcal{N}_h, N_\star)`.
-    N : int, optional (default = None)
-      Dimension of the reduced space, modes to be used. If `None` all the modes are used.
-    
-    Returns
-    -------
-    coeff : np.ndarray
-      Modal POD coefficients of `snap`, :math:`\mathbf{V}^\dagger_\star`.
-    """
+        for nn in range(Nmax):
 
-    if N is None:
-      N = self.Nmax
-    
-    if isinstance(snap, FunctionsList):
-      _snap = snap.return_matrix()
-    else:
-      _snap = snap
-    
-    Vh_star = np.dot(np.linalg.inv(np.diag(self.sing_vals[:N])), 
-                     np.dot(self.modes.return_matrix().T[:N], _snap))
-    
-    return Vh_star
-  
-  def reconstruct(self, Vh_star: np.ndarray):
-    r"""
-    The reduced coefficients :math:`\mathbf{V}^\dagger_\star\in\mathbb{R}^{N\times N_\star}` are used to decode into the Full Order space :math:`\mathbb{R}^{\mathcal{N}_h}` using `N` modes :math:`\mathbb{U}\in\mathbb{R}^{\mathcal{N}_h\times N}`.
+            if verbose: 
+                progressBar.update(1, percentage = False)
 
-    .. math::
-      \mathbb{S}_\star = \mathbb{U}\Sigma\mathbf{V}^\dagger_\star
-    
-    Parameters
-    ----------
-    Vh_star : np.ndarray 
-      Matrix object containing the POD coefficients. Must be :math:`(N, N_\star)`.
-    
-    Returns
-    -------
-    snaps : np.ndarray
-      Reconstructed field returned as an element of :math:`\mathbf{R}^{\mathcal{N_h}\times N_\star}`.
-    """
-    
-    N = len(Vh_star)
-    assert( N <= self.Nmax )
-    
-    return np.dot(self.modes.return_matrix()[:, :N] * self.sing_vals[:N], Vh_star)
+            timer.start()
+            _coeffs = self.reduce(snaps, nn+1) # shape (N, Ns)
+            reconstructed_snaps = self.reconstruct(_coeffs)
+            computational_time['StateEstimation'][:, nn] = timer.stop()
 
-  def train_error(self, train_snap: FunctionsList, maxBasis: int, verbose = False):
-    r"""
-    The maximum absolute :math:`E_N` and relative :math:`\varepsilon_N` error on the train set is computed, by projecting it onto the reduced space in :math:`l^2`-sense
+            for mu_i in range(Ns):
+                timer.start()
+                _resid = snaps[:, mu_i] - reconstructed_snaps(mu_i)
+                abs_err[mu_i, nn] = self.calculator.L2_norm(_resid)
+                rel_err[mu_i, nn] = abs_err[mu_i, nn] / _snap_norm[mu_i]
+                computational_time['Errors'][mu_i, nn] += timer.stop()
 
-    .. math::
-      E_N = \max\limits_{\boldsymbol{\mu}\in\Xi_{\text{train}}} \left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{2}
-    .. math::
-      \varepsilon_N = \max\limits_{\boldsymbol{\mu}\in\Xi_{\text{train}}} \frac{\left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{2}}{\left\| u(\mathbf{x};\,\boldsymbol{\mu})\right\|_{2}}
+        Results = namedtuple('Results', ['mean_abs_err', 'mean_rel_err', 'computational_time'])
+        _res = Results(mean_abs_err = abs_err.mean(axis = 0), mean_rel_err = rel_err.mean(axis = 0), computational_time = computational_time)
+
+        return _res
     
-    The POD coefficients used are the ones obtained by the SVD during the initialisation.
+    def save(self, path_folder: str, **kwargs):
+        r"""
+        Save the POD modes and the eigenvalues to a specified path.
 
-    Parameters
-    ----------
-    train_snap : FunctionsMatrix or FunctionsList
-      List of snapshots to compute errors
-    maxBasis : int
-      Integer input indicating the maximum number of modes to use.
-    verbose : boolean, optional (Default = False) 
-      If `True`, print of the progress is enabled.
-
-    Returns
-    -------
-    maxAbsErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-    maxRelErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-      
-    """
-    
-    assert(maxBasis <= self.Nmax)
-    
-    absErr = np.zeros((self.Ns, maxBasis))
-    relErr = np.zeros_like(absErr)
-
-    if verbose:
-        progressBar = LoopProgress(msg="Computing train error - "+self.name, final = self.Ns)
-      
-    for mu in range(self.Ns):
-      norm = np.linalg.norm(train_snap(mu))
-      for rank in range(maxBasis):
-        recon = self.reconstruct(self.Vh_train[:rank+1, mu])
-        absErr[mu, rank] = np.linalg.norm(recon - train_snap(mu))
-        relErr[mu, rank] = absErr[mu, rank] / norm
-      
-      if verbose:
-        progressBar.update(1, percentage=False)
+        Parameters
+        ----------
+        path_folder : str
+            The folder path where the model will be saved.
+        **kwargs : dict
+            Additional keyword arguments for saving options.
+        """
         
-    return absErr.max(axis = 0), relErr.max(axis = 0)
+        os.makedirs(path_folder, exist_ok=True)
 
-  def test_error(self, test_snap: FunctionsList, maxBasis: int, verbose = False):
-    r"""
-    The maximum absolute :math:`E_N` and relative :math:`\varepsilon_N` error on the train set is computed, by projecting it onto the reduced space in :math:`l^2`-sense
+        # Save the POD modes
+        self.pod_modes.store(f'PODmode_{self.varname}', 
+                             filename=os.path.join(path_folder, f'PODmode_{self.varname}'),
+                             **kwargs)
 
-    .. math::
-      E_N = \max\limits_{\boldsymbol{\mu}\in\Xi_{\text{train}}} \left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{2}
-    .. math::
-      \varepsilon_N = \max\limits_{\boldsymbol{\mu}\in\Xi_{\text{train}}} \frac{\left\| u(\mathbf{x};\,\boldsymbol{\mu}) -  \sum_{n=1}^N \alpha_n(\boldsymbol{\mu})\cdot \psi_n(\mathbf{x})\right\|_{2}}{\left\| u(\mathbf{x};\,\boldsymbol{\mu})\right\|_{2}}
-    
-    The POD coefficients used are the ones obtained by projection of `test_snap`.
-
-    Parameters
-    ----------
-    test_snap : FunctionsMatrix or FunctionsList
-      List of snapshots to project and compute errors
-    maxBasis : int
-      Integer input indicating the maximum number of modes to use.
-    verbose : boolean, optional (Default = False) 
-      If `True`, print of the progress is enabled.
-
-    Returns
-    -------
-    maxAbsErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-    maxRelErr : np.ndarray
-      Maximum absolute errors as a function of the dimension of the reduced space.
-      
-    """
-    
-    assert(maxBasis <= self.Nmax)
-    
-    absErr = np.zeros((self.Ns, maxBasis))
-    relErr = np.zeros_like(absErr)
-
-    if verbose:
-        progressBar = LoopProgress(msg="Computing train error - "+self.name, final = self.Ns)
-      
-    for mu in range(self.Ns):
-      norm = np.linalg.norm(test_snap(mu))
-      for rank in range(maxBasis):
-
-        # Obtain the POD coefficient by projection
-        vh = self.projection(test_snap(mu), rank+1)
-
-        # Reconstruct the field
-        recon = self.reconstruct(vh)
-
-        # Compute the error
-        absErr[mu, rank] = np.linalg.norm(recon - test_snap(mu))
-        relErr[mu, rank] = absErr[mu, rank] / norm
-      
-      if verbose:
-        progressBar.update(1, percentage=False)
-        
-    return absErr.max(axis = 0), relErr.max(axis = 0)
+        np.save(os.path.join(path_folder, f'eigenvalues_{self.varname}.npy'), self.eigenvalues)

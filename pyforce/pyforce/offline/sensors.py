@@ -1,454 +1,455 @@
-# Offline Phase: sensors positioning
+# Offline Phase: sensors classes
 # Author: Stefano Riva, PhD Student, NRG, Politecnico di Milano
-# Latest Code Update: 25 April 2024
-# Latest Doc  Update: 25 April 2024
+# Latest Code Update: 07 October 2025
+# Latest Doc  Update: 07 October 2025
 
 import numpy as np
-import scipy
-from dolfinx import fem
-import dolfinx
-import warnings
+from ..tools.functions_list import FunctionsList
+from ..tools.backends import IntegralCalculator, LoopProgress
+import pyvista as pv
 
-import ufl
-from dolfinx.fem import (Function, FunctionSpace, assemble_scalar, form)
-from ufl import dx, grad, inner, dot
-from petsc4py import PETSc
+from abc import ABC, abstractmethod
 
-from pyforce.tools.backends import norms, LoopProgress
-from pyforce.tools.functions_list import FunctionsList
-
-# Class to define gaussian sensors with a Riesz representation in L2
-class GaussianSensors():
-  r"""
-    A class to define normalised gaussian sensors in terms of functional to mimic measurements of scalar fields.
-    The measurement procedure is described through a linear functional with gaussian kernel, i.e.
-
-    .. math::
-        v_k = v(u;\,\mathbf{x}_k,s) = \int_\Omega u(\mathbf{x})\cdot g(\mathbf{x};\,\mathbf{x}_k,s)\,d\Omega 
-        \qquad
-        \text{ given } g(\mathbf{x};\,\mathbf{x}_k,s) = 
-        \frac{e^{-\frac{\|{\mathbf{x}-\mathbf{x}_k}\|_2^2}{2s^2}}}{\displaystyle\int_\Omega e^{-\frac{\|{\mathbf{x}-\mathbf{x}_k}\|_2^2}{2s^2}}\,d\Omega}
-        
-    such that :math:`v(1;\,\mathbf{x}_k,s) = 1`.
-
-    Parameters
-    ----------
-    domain : dolfinx.mesh
-        Mesh onto which the sensors are defined.
-    V : FunctionSpace
-        Functional space onto which the kernel of the sensors are interpolated.
-    s : float
-        Standard deviation of the gaussian kernel.
-    assemble_riesz : boolean, optional (Default: False)
-        Logic variable indicating whether or not to assemble the variational forms for the Riesz representations.
-
-  """
-  def __init__(self, domain, V: FunctionSpace, s: float, assemble_riesz: bool = False) -> None:
-    self.domain = domain
-    self.V = V
-    self.s = s # standard deviation of the guassian
-
-    self.norm = norms(self.V)
-    self.g = Function(self.V).copy()
-
-    if assemble_riesz:
-        self.trial = ufl.TrialFunction(self.V)
-        self.test  = ufl.TestFunction(self.V)
-
-        self.riesz_lhs = ( dot(grad(self.trial), grad(self.test)) + dot(self.trial, self.test) ) * dx
-        self.riesz_rhs = dot(self.g, self.test) * dx
-
-        self.riesz_bilin = form(self.riesz_lhs)
-        self.riesz_lin   = form(self.riesz_rhs)
-
-        self.riesz_A = fem.petsc.assemble_matrix(self.riesz_bilin)
-        self.riesz_A.assemble()
-        self.riesz_b = fem.petsc.create_vector(self.riesz_lin)
-
-        self.solver = PETSc.KSP().create(self.domain.comm)
-        self.solver.setOperators(self.riesz_A)
-        self.solver.setType(PETSc.KSP.Type.PREONLY)
-        self.solver.getPC().setType(PETSc.PC.Type.LU)
-
-  def define(self, x_m: np.ndarray) -> Function:
+class SensorLibraryBase(ABC):
     r"""
-    Given a position :math:`x_m` defines the kernel function of the sensor as a Gaussian with given point spread `s`
-    
+    Abstract base class for sensors, mathematically modelled as linear functionals:
+
     .. math::
-        g(\mathbf{x};\,\mathbf{x}_m,s) = 
-        \frac{e^{-\frac{\|{\mathbf{x}-\mathbf{x}_m}\|_2^2}{2s^2}}}{\displaystyle\int_\Omega e^{-\frac{\|{\mathbf{x}-\mathbf{x}_m}\|_2^2}{2s^2}}\,d\Omega}
-    
-    This kernel function is the Riesz representation :math:`q_m` in :math:`L^2` of the functional, i.e.
-    
-    .. math::
-        (q_m, \varphi)_{L^2} =
-        \int_\Omega q_m\cdot \varphi \,d\Omega = v_m(\varphi)\qquad \forall \varphi\in L^2
+        v(u; \boldsymbol{\xi}) = \int_{\Omega} u(\mathbf{x}) \mathcal{K}(\mathbf{x}, \boldsymbol{\xi}) d\mathbf{x}
+
+    where :math:`\mathcal{K}(\mathbf{x}, \boldsymbol{\xi})` is the kernel function and :math:`\boldsymbol{\xi}` are the sensor parameters (e.g., centre of mass and variance for Gaussian sensors).
 
     """
-    Gaussian = self.g.copy()
-    # normGaussian = self.g.copy()
+
+    @property
+    def nodes(self):
+        """Return the nodes where the sensors are placed."""
+        return self._nodes
+
+    @property
+    def library(self):
+        """Return the library of sensors."""
+        return self._library
     
-    Gaussian.interpolate(    lambda x:  np.exp( - ((x[0]-x_m[0])**2+(x[1]-x_m[1])**2+(x[2]-x_m[2])**2) / 2 / self.s**2)  )
-    # normGaussian.interpolate(lambda x: (np.exp( - ((x[0]-x_m[0])**2+(x[1]-x_m[1])**2+(x[2]-x_m[2])**2) / 2 / self.s**2) ) 
-    #                                     / self.norm.integral(Gaussian) )
-    
-    normGaussian = Gaussian.x.array[:] / self.norm.integral(Gaussian)
-    
-    return normGaussian
-
-  def define_riesz(self, x_m: np.ndarray) -> Function:
-    r"""
-    Given a position :math:`x_m` defines the kernel function :math:`q_m` of the sensor as the Riesz representation in :math:`H^1` of the functional, i.e.
-    
-    .. math::
-        (q_m, \varphi)_{H^1} =
-        \int_\Omega q_m\cdot \varphi \,d\Omega + \int_\Omega \nabla q_m\cdot \nabla \varphi \,d\Omega
-        = v_m(\varphi)\qquad \forall \varphi\in H^1
-
-    """
-    self.g.x.array[:] = self.define(x_m)
-
-    with self.riesz_b.localForm() as loc_b:
-        loc_b.set(0)
-    fem.petsc.assemble_vector(self.riesz_b, self.riesz_lin)
-
-    representation = self.g.copy()
-    self.solver(self.riesz_b, representation.vector)
-    representation.x.scatter_forward()
-    return representation
-
-  def create(self, xm : list = None, sampleEvery: int = 10, is_H1 : bool = False, verbose = False) -> FunctionsList:
-    r"""
-    This function creates the list of sensors (using Riesz representation either in :math:`L^2` or in :math:`H^1`), either by sampling from the mesh or from a prescribed list of positions.
-
-    Parameters
-    ----------
-    xm : list, optional (Default: None)
-        Possible List of positions for the sensors inside the domain.
-    sampleEvery : int, optional (Default: 10)
-        Integers indicating sampling rate to be used on the mesh, if `x_m` is `None`.
-    is_H1 : bool, optional (Default: False)
-        If `True`, the Riesz representation in :math:`H^1` is used.
-    verbose : boolean, optional (Default = False)
-        If `True`, printing is enabled.
-
-    Returns
-    -------
-    sens_list : FunctionsList
-        List of kernel functions using a Riesz representation in :math:`L^2`
-    """
-
-    sens_list = FunctionsList(self.V)
-    
-    if xm is None:
-        geom_dofs = self.domain.geometry.x
-        mSample = np.arange(0, len(geom_dofs), sampleEvery) # the cells on the boundary are avoided
-        self.xm_list = []
-        if verbose:
-            progressBar = LoopProgress(msg = "Generating sensors (sampled every "+str(sampleEvery)+" cells)", final = len(mSample))
-        for m in mSample:
-            x_m = geom_dofs[m]
-            self.xm_list.append(x_m)
-    else:
-        if verbose:
-            progressBar = LoopProgress(msg = "Generating sensors (coinstrained cells)", final = len(xm))
-        self.xm_list = xm.copy()
-    
-    for m in range(len(self.xm_list)):
-        if is_H1:
-            sens_list.append(self.define_riesz(self.xm_list[m]))
+    def __len__(self):
+        """Return the number of sensors in the library."""
+        if self._library is None:
+            return 0
         else:
-            sens_list.append(self.define(self.xm_list[m]))
-        if verbose:
-            progressBar.update(1, percentage=False)
+            return len(self._library)
+
+    @abstractmethod
+    def _define(self, **kwargs):
+        """Abstract method to define a sensor, given its parameters."""
+        pass
+
+    @abstractmethod
+    def create_library(self, **kwargs):
+        """Abstract method to create a library of sensors."""
+        pass
+
+    def __call__(self, func: FunctionsList | np.ndarray, **kwargs):
+        """Compute the action of the sensor on a given function."""
         
-    return sens_list
-
-  def action_single(self, fun: Function, sensor: Function):
-    r"""
-    Given an input function `fun` :math:`=f` and a sensors :math:`v_m`, the action of the sensor is applied to the function, as an inner product in :math:`L^2`:
-
-    .. math::
-        y_m = v_m\left(f\right)
-
-    Parameters
-    ----------
-    fun : Function
-        Function onto which the action is applied.
-    sensor : Function
-        Riesz representation of the sensor
-    
-    Returns
-    -------
-    measure : float
-        Scalar :math:`y_m` with the measure of the function with respect to the sensor :math:`v_m`.
-    """
-        
-    measure = self.norm.L2innerProd(fun, sensor)
-
-    return measure
-
-  def action(self, fun: Function, sens: FunctionsList):
-    r"""
-    Given an input function `fun` :math:`=f` and a list of sensors :math:`\{v_m\}_{m=1}^M`, the action of the sensor is applied to the function, as an inner product in :math:`L^2`:
-
-    .. math::
-        y_m = v_m\left(f\right)\qquad m = 1, \dots, M
-
-    Parameters
-    ----------
-    fun : Function
-        Function onto which the action is applied.
-    sens : FunctionsList
-        List of available sensors
-    
-    Returns
-    -------
-    measure : np.ndarray
-        Vector :math:`\mathbf{y}\in\mathbb{R}^M`, whose dimension is equal to the number of input sensors.
-    """
-    measure = np.zeros((len(sens),))
-    for sensI in range(len(sens)):
-      measure[sensI] = self.norm.L2innerProd(fun, sens(sensI))
-
-    return measure
-  
-# SGREEDY algorithm for sensor selection (both representation in L2 and H1)
-class SGREEDY(): 
-  r"""
-    A class to perform the SGREEDY algorithm, given a list of basis functions :math:`\{\phi_n\}_{n=1}^N`.
-
-    Parameters
-    ----------
-    domain : dolfinx.mesh
-        Mesh for the sensor placement.
-    basis : FunctionsList
-        List of basis functions :math:`\{\phi_n\}_{n=1}^N`, previously generated.
-    V : FunctionSpace
-        Functional space of the functions.
-    name : str
-        Name of the snapshots (e.g., temperature T)
-    s : float
-        Standard deviation of the gaussian kernel for the sensors
-
-  """
-  def __init__(self, domain: dolfinx.mesh.Mesh, basis: FunctionsList, V: FunctionSpace, name: str, s: float) -> None:
-
-    self.basis = basis
-    self.V = V
-    self.name = name
-    self.domain = domain
-
-    # Generate sensor library
-    self.sens_class = GaussianSensors(domain, self.V, s, assemble_riesz = True)
-
-  def generate(self, N: int, Mmax: int, tol: float = 0.2,
-               xm : list = None, sampleEvery : int = 10, is_H1 : bool = False, verbose = False):
-    r"""
-    Selection of sensors position with a Riesz representation :math:`\{g_m\}_{m=1}^M` either in :math:`L^2` or :math:`H^1`.
-    The positions of the sensors are either freely selected on the mesh or given as input.
-
-    Parameters
-    ----------
-    N : int
-        Dimension of the reduced space.
-    Mmax : int
-        Maximum number of sensors to select.
-    tol : float, optional (Default=0.2)
-        Tolerance to exit the stability loop
-    xm : list, optional (Default=None)
-        If not `None`, list of available positions for the sensors.
-    sampleEvery : int, optional (Default = 10)
-        Sampling points on the mesh.
-    is_H1 : bool, optional (Default: False)
-        If `True`, the Riesz representation in :math:`H^1` is used.
-    verbose : boolean, optional (Default = False)
-        If `True`, printing is enabled.
-
-    """
-
-    self.norm = norms(self.V, is_H1 = is_H1)
-    sens_lib = self.sens_class.create(xm = xm, sampleEvery=sampleEvery, is_H1=is_H1, verbose=verbose)
-
-    inf_sup_list = []
-
-    self.xm_sens = []
-    self.basis_sens = FunctionsList(self.V)
-
-    # Define first point
-    if is_H1:
-        measure = np.zeros((len(sens_lib), ))
-        for jj in range(len(sens_lib)):
-            measure[jj] = self.norm.H1innerProd(np.abs(self.basis(0)), sens_lib(jj), semi = False)
-        sensIDX = np.argmax(measure)
-    else:
-        sensIDX = np.argmax( self.sens_class.action(np.abs(self.basis(0)), sens_lib) )
-    self.basis_sens.append(sens_lib(sensIDX))
-    self.xm_sens.append(self.sens_class.xm_list[sensIDX])
-    
-    # Is this necessary?
-    sens_lib.delete(sensIDX)
-    self.sens_class.xm_list.pop(sensIDX)
-    
-    m = 1
-
-    resid = Function(self.V).copy()
-    while m < Mmax:
-        n = min(np.array([N, m]))
-
-        matr_A = np.zeros((m, m))
-        matr_K = np.zeros((m, n))
-        matr_Z = np.zeros((n, n))
-
-        for ii in range(m):
-            for jj in range(m):
-                if jj>=ii:
-                    if is_H1:
-                        matr_A[ii, jj] = self.norm.H1innerProd(self.basis_sens(ii), self.basis_sens(jj), semi = False)
-                    else:
-                        matr_A[ii, jj] = self.norm.L2innerProd(self.basis_sens(ii), self.basis_sens(jj))
-                else:
-                    matr_A[ii, jj] = matr_A[jj, ii]
-                    
-            for kk in range(n):
-                if is_H1:
-                    matr_K[ii, kk] = self.norm.H1innerProd(self.basis_sens(ii), self.basis(kk), semi = False)
-                else:
-                    matr_K[ii, kk] = self.norm.L2innerProd(self.basis_sens(ii), self.basis(kk))
-
-        for ii in range(n):
-            for jj in range(n):
-                if jj>=ii:
-                    if is_H1:
-                        matr_Z[ii, jj] = self.norm.H1innerProd(self.basis(ii), self.basis(jj), semi = False)
-                    else:
-                        matr_Z[ii, jj] = self.norm.L2innerProd(self.basis(ii), self.basis(jj))
-                else:
-                    matr_Z[ii, jj] = matr_Z[jj, ii]
-        
-        schurComplement = np.matmul(matr_K.T, np.matmul(np.linalg.inv(matr_A), matr_K))
-        
-        # Solve the eig problem for beta - schurComplement is an Hermitian matrix
-        beta_squared, eigenVec_beta = scipy.linalg.eigh(schurComplement, matr_Z)
-
-        inf_sup_list.append( np.sqrt(min(beta_squared)) )
-        idx_min_eig = np.argmin(beta_squared)
-
-        # print output
-        if verbose:
-            print(f'm = {m+0:02}, n = {n+0:02} | beta_n,m = {inf_sup_list[m-1]:.6f}', end = "\r")
-
-        # Compute the least stable mode
-        w_inf = self.basis.lin_combine(eigenVec_beta[:, idx_min_eig])
-
-        # Compute projection 
-        coeff = np.zeros((len(self.basis_sens),))
-        for jj in range(len(self.basis_sens)):
-            if is_H1:        
-                coeff[jj] = self.norm.H1innerProd(w_inf, self.basis_sens(jj), semi = False)
-            else:
-                coeff[jj] = self.norm.L2innerProd(w_inf, self.basis_sens(jj))
-        # coeff = self.sens_class.action(w_inf, self.basis_sens)
-
-        # Identify the least approximated functional    
-        resid.x.array[:] = self.basis_sens.lin_combine(coeff) - w_inf
-        if is_H1:
-            measure = np.zeros((len(sens_lib),))
-            for jj in range(len(sens_lib)):
-                measure[jj] = abs(self.norm.H1innerProd(resid, sens_lib(jj), semi = False))
+        if isinstance(func, FunctionsList):
+            _output = list()
+            for f in func:
+                _output.append(self._action(f, **kwargs))
+            return np.array(_output).T # shape (Nsensors, Ns)
+        elif isinstance(func, np.ndarray):
+            return self._action(func, **kwargs).reshape(-1, 1) # shape (Nsensors, 1)
         else:
-            measure = abs(self.sens_class.action(resid, sens_lib))
-        sensIDX = np.argmax(measure)
-        self.xm_sens.append(self.sens_class.xm_list.pop(sensIDX))
-        self.basis_sens.append(sens_lib._list.pop(sensIDX))
+            raise TypeError("Input must be a FunctionsList or a numpy array.")
 
-        m += 1
+    def set_library(self, library: FunctionsList):
+        r"""
+        Set the sensor library to a given FunctionsList.
+
+        Parameters
+        ----------
+        library: FunctionsList
+            The library of sensors to be set.
+        """
+        self._library = FunctionsList(dofs = len(self.nodes))
+
+        self._library._list = library._list.copy()
+
+    def add_sensor(self, kernel: np.ndarray):
+        r"""
+        Add a sensor to the library.
+
+        Parameters
+        ----------
+        kernel: np.ndarray
+            The kernel function of the sensor to be added.
+        """
+        if self._library is None:
+            self._library = FunctionsList(dofs = len(self.nodes))
+
+        self._library.append(kernel)
+
+    def _action_single(self, func: np.ndarray, idx_sens: int):
+        r"""
+        Compute the action of a single sensor on a given function.
+
+        Parameters
+        ----------
+        func: np.ndarray
+            The function to be sensed.
+        idx_sens: int
+            The index of the sensor in the library.
+
+        Returns
+        -------
+        action: float
+            The action of the sensor on the function.
+        """
+        if self._library is None:
+            raise ValueError("Sensor library is not created. Please call 'create_library' or `set_library` methods first.")
+
+        return self.calculator.L2_inner_product(func, self._library[idx_sens])
+
+    def action(self, func: FunctionsList | np.ndarray, M: int = None):
+        r"""
+        Compute the action of the sensor library on a given function (both single or matrix) or a list of functions.
+
+        Parameters
+        ----------
+        func: FunctionsList | np.ndarray
+            The function or list of functions to be sensed.
+        M: int, optional (default=None)
+            If provided, only the first M sensors in the library are used.
+
+        Returns
+        -------
+        actions: np.ndarray
+            The actions of the sensor library on the function(s). Shape (Nsensors, Ns).
+        """
+
+        if self._library is None:
+            raise ValueError("Sensor library is not created. Please call 'create_library' or `set_library` methods first.")
+
+        if M is None:
+            M = len(self._library)
+        else:
+            assert M <= len(self._library), "M cannot be larger than the number of sensors in the library."
+
+        if isinstance(func, FunctionsList):
+            _measurements = list()
+            for f in func:
+                _measurements.append(
+                                    np.array([self._action_single(f, i) for i in range(M)])
+                                    )
+            return np.array(_measurements).T # shape (Nsensors, Ns)
         
-        if inf_sup_list[-1] > tol and m >= N:
-            break
-    
-    if m < Mmax:
-        if verbose:
-            print(' ')
-            print('-----------------------------------------')
-            print('Starting approximation loop')
-            print(' ')
-        self.approx_loop(Mmax, is_H1=is_H1)
-        m = Mmax
+        elif isinstance(func, np.ndarray):
 
-    # Last step
-    n = min(np.array([N, m]))
-
-    matr_A = np.zeros((m, m))
-    matr_K = np.zeros((m, n))
-    matr_Z = np.zeros((n, n))
-
-    for ii in range(m):
-        for jj in range(m):
-            if is_H1:
-                matr_A[ii, jj] = self.norm.H1innerProd(self.basis_sens(ii), self.basis_sens(jj), semi = False)
-            else:
-                matr_A[ii, jj] = self.norm.L2innerProd(self.basis_sens(ii), self.basis_sens(jj))
-        for kk in range(n):
-            if is_H1:
-                matr_K[ii, kk] = self.norm.H1innerProd(self.basis_sens(ii), self.basis(kk), semi = False)
-            else:
-                matr_K[ii, kk] = self.norm.L2innerProd(self.basis_sens(ii), self.basis(kk))
-
-    for ii in range(n):
-        for jj in range(n):
-            if is_H1:
-                matr_Z[ii, jj] = self.norm.H1innerProd(self.basis(ii), self.basis(jj), semi = False)
-            else:
-                matr_Z[ii, jj] = self.norm.L2innerProd(self.basis(ii), self.basis(jj))
+            if func.ndim == 1:
+                func = np.atleast_2d(func).T # shape (N, 1)
+            
+            _measurements = list()
+            for ii in range(func.shape[1]):
+                _measurements.append(
+                                    np.array([self._action_single(func[:, ii], i) for i in range(M)])
+                                    )
+            return np.array(_measurements).T # shape (Nsensors, Ns)
         
-    schurComplement = np.matmul(matr_K.T, np.matmul(np.linalg.inv(matr_A), matr_K))
-    
-    # Solve the eig problem for beta
-    beta_squared, eigenVec_beta = scipy.linalg.eigh(schurComplement, matr_Z)
-
-    inf_sup_list.append( np.sqrt(min(beta_squared)) )
-    if verbose:
-        print(f'm = {m+0:02}, n = {n+0:02} | beta_n,m = {inf_sup_list[-1]:.6f}')
-
-  def approx_loop(self, Mmax: int, is_H1 : bool = True):
+class GaussianSensorLibrary(SensorLibraryBase):
     r"""
-    Approximation loop for the selection of sensors position with a Riesz representation :math:`\{g_m\}_{m=1}^M` either in :math:`L^2` or :math:`H^1`.
-    At each step `m`, the next position is selected by the following
-    
+    A class implementing a library of Gaussian sensors.
+
+    A Gaussian sensor is mathematically modelled as a linear functional, with a Gaussian kernel function with two parameters: centre of mass and variance:
+
     .. math::
-        \mathbf{x}_{m+1} = \text{arg }\max\limits_{\mathbf{x}\in \Omega^\star}\left(\min\limits_{i=1, \dots, m} \| \mathbf{x}-\mathbf{x}_i\|_2\right)
-    
-    given $\Omega^\star\subset\Omega$ a subset of the whole domain, in which sensors are allowed to be placed. Once the position is known, the functional and its Riesz representation are straightforwardly defined.
+        v(u(\mathbf{x}); \mathbf{x}_m, s) = C\cdot \int_{\Omega} u(\mathbf{x}) \exp\left(-\frac{||\mathbf{x} - \mathbf{x}_m||^2}{2s^2}\right) d\mathbf{x}
+
+    where :math:`\mathbf{x}_m` is the centre of mass, :math:`s` is the standard deviation (variance), and :math:`C` is a normalization constant, such that :math:`v(1; \mathbf{x}_m, s) = 1` or equivalently that the :math:`L^1` norm of the kernel is equal to one.
+
+    Parameters
+    ----------
+    grid: pyvista.UnstructuredGrid
+        The computational grid.
+    use_centroids: bool, optional (default=True)
+        If True, the sensors are placed at the centroids of the grid cells. If False, the sensors are placed at the grid points.
+    gdim: int, optional (default=3)
+        The geometric dimension of the problem. Default is 3.
+
+    """
+
+    def __init__(self, grid: pv.UnstructuredGrid, use_centroids: bool = True, gdim: int = 3):
+
+        self.grid = grid
+        self.gdim = gdim
+        self.calculator = IntegralCalculator(grid, gdim)
+        
+        self._library = None
+
+        if use_centroids:
+            self._nodes = grid.cell_centers().points
+        else:
+            self._nodes = grid.points
+
+    def _define(self, xm: np.ndarray, s: float):
+        r"""
+        Define a Gaussian sensor given its parameters.
+
+        Parameters
+        ----------
+        xm: np.ndarray
+            The centre of mass of the Gaussian sensor.
+        s: float
+            The standard deviation (variance) of the Gaussian sensor.
+
+        Returns
+        -------
+        kernel: function
+            The kernel function of the Gaussian sensor.
+        """
+
+        
+        def kernel(x):
+            return np.exp(-np.linalg.norm(x - xm, axis=1)**2 / (2 * s**2))
+        
+        _kernel = kernel(self.nodes)
+
+        # Normalization constant
+        C = 1.0 / self.calculator.L1_norm(_kernel)
+
+        return _kernel * C
+
+    def create_library(self, s: float, xm_list: np.ndarray = None, 
+                       verbose: bool = False):
+        r"""
+        Create a library of Gaussian sensors, given a variance and a list of centres of mass (if provided).
+        
+        Parameters
+        ----------
+        s: float
+            The standard deviation (variance) of the Gaussian sensors.
+        xm_list: np.ndarray, optional (default=None)
+            A list of centres of mass for the Gaussian sensors. If None, the sensors are placed at the grid nodes.
+        verbose: bool, optional (default=False)
+            If True, print progress information.
+
+        """
+
+        if xm_list is None:
+            xm_list = self.nodes.tolist()
+
+        self.xm_list = xm_list
+        
+        self._library = FunctionsList(dofs = len(self.nodes))
+        if verbose:
+            progress = LoopProgress(msg="Creating Gaussian Sensor Library", final=len(xm_list))
+
+        for xm in xm_list:
+
+            # Define and append the sensor to the library
+            self._library.append(
+                self._define(xm=xm, s=s)
+            )
+
+            # Update progress bar
+            if verbose:
+                progress.update(1, percentage=True)
+        
+class ExponentialSensorLibrary(SensorLibraryBase):
+    r"""
+    A class implementing a library of Exponential sensors.
+
+    An Exponential sensor is mathematically modelled as a linear functional, with an Exponential kernel function with two parameters: centre of mass and variance:
+
+    .. math::
+        v(u(\mathbf{x}); \mathbf{x}_m, s) = C\cdot \int_{\Omega} u(\mathbf{x}) \exp\left(-\frac{||\mathbf{x} - \mathbf{x}_m||}{s}\right) d\mathbf{x}
+
+    where :math:`\mathbf{x}_m` is the centre of mass, :math:`s` is the standard deviation (variance), and :math:`C` is a normalization constant, such that :math:`v(1; \mathbf{x}_m, s) = 1` or equivalently that the :math:`L^1` norm of the kernel is equal to one.
+
+    Parameters
+    ----------
+    grid: pyvista.UnstructuredGrid
+        The computational grid.
+    use_centroids: bool, optional (default=True)
+        If True, the sensors are placed at the centroids of the grid cells. If False, the sensors are placed at the grid points.
+    gdim: int, optional (default=3)
+        The geometric dimension of the problem. Default is 3.
+
+    """
+
+    def __init__(self, grid: pv.UnstructuredGrid, use_centroids: bool = True,
+                 gdim: int = 3):
+
+        self.grid = grid
+        self.gdim = gdim
+        self.calculator = IntegralCalculator(grid, gdim)
+        
+        self._library = None
+
+        if use_centroids:
+            self._nodes = grid.cell_centers().points
+        else:
+            self._nodes = grid.points
+
+    def _define(self, xm: np.ndarray, s: float):
+        r"""
+        Define an Exponential sensor given its parameters.
+
+        Parameters
+        ----------
+        xm: np.ndarray
+            The centre of mass of the Exponential sensor.
+        s: float
+            The standard deviation (variance) of the Exponential sensor.
+
+        Returns
+        -------
+        kernel: function
+            The kernel function of the Exponential sensor.
+        """
+        def kernel(x):
+            return np.exp(-np.linalg.norm(x - xm, axis=1) / s)
+
+        _kernel = kernel(self.nodes)
+
+        # Normalization constant
+        C = 1.0 / self.calculator.L1_norm(_kernel)
+
+        return _kernel * C
+
+
+    def create_library(self, s: float, xm_list: np.ndarray = None, 
+                       verbose: bool = False):
+        r"""
+        Create a library of Exponential sensors, given a variance and a list of centres of mass (if provided).
+        
+        Parameters
+        ----------
+        s: float
+            The standard deviation (variance) of the Exponential sensors.
+        xm_list: np.ndarray, optional (default=None)
+            A list of centres of mass for the Exponential sensors. If None, the sensors are placed at the grid nodes.
+        verbose: bool, optional (default=False)
+            If True, print progress information.
+
+        """
+
+        if xm_list is None:
+            xm_list = self.nodes.tolist()
+
+        self.xm_list = xm_list
+        
+        self._library = FunctionsList(dofs = len(self.nodes))
+        if verbose:
+            progress = LoopProgress(msg="Creating Exponential Sensor Library", final=len(xm_list))
+
+        for xm in xm_list:
+
+            # Define and append the sensor to the library
+            self._library.append(
+                self._define(xm=xm, s=s)
+            )
+
+            # Update progress bar
+            if verbose:
+                progress.update(1, percentage=True)
+
+class IndicatorFunctionSensorLibrary(SensorLibraryBase):
+    r"""
+    A class implementing a library of Indicator Function sensors.
+
+    An Indicator Function sensor is mathematically modelled as a linear functional, with an Indicator Function kernel:
+
+    .. math::
+        v(u(\mathbf{x}); \mathbf{x}_m, r) = \int_{\Omega} u(\mathbf{x}) \mathcal{I}(\mathbf{x}, \mathbf{x}_m, r) d\mathbf{x}
+
+    where :math:`\mathcal{I}(\mathbf{x}, \mathbf{x}_m, r)` is the indicator function defined as:
+
+    .. math::
+        \mathcal{I}(\mathbf{x}, \mathbf{x}_m, r) = 
+        \begin{cases}
+        1 & \text{if } ||\mathbf{x} - \mathbf{x}_m|| \leq r \\
+        0 & \text{otherwise}
+        \end{cases}
+
+    where :math:`\mathbf{x}_m` is the centre of mass and :math:`r` is the radius.
     
     Parameters
     ----------
-    Mmax : int
-        Maximum number of sensors allows.
-    is_H1 : bool, optional (Default: False)
-        If `True`, the Riesz representation in :math:`H^1` is used.
-
+    grid: pyvista.UnstructuredGrid
+        The computational grid.
+    use_centroids: bool, optional (default=True)    
+        If True, the sensors are placed at the centroids of the grid cells. If False, the sensors are placed at the grid points.
+    gdim: int, optional (default=3)
+        The geometric dimension of the problem. Default is 3.
     """
-    m = len(self.xm_sens)
-    xdofs = np.array(self.sens_class.xm_list).reshape(-1,3)
-    xm_sens_np = np.array(self.xm_sens)
-    
-    while m <= Mmax:
-        min_xdofs = np.zeros((len(xdofs),))
-        for ii in range(len(xdofs)):
-            x = xdofs[ii]
-            min_xdofs[ii] = np.min(np.linalg.norm(xm_sens_np - x, axis=1))
+
+    def __init__(self, grid: pv.UnstructuredGrid, 
+                 use_centroids: bool = True,
+                 gdim: int = 3):
         
-        idx_max = np.argmax(min_xdofs)
-        xm_sens_np = np.vstack([xm_sens_np, xdofs[idx_max]])
-        
-        # append to the xm sensor list
-        self.xm_sens.append(xm_sens_np[-1])
-        
-        # Generate sensor
-        if is_H1:
-            self.basis_sens.append(self.sens_class.define_riesz(xdofs[idx_max]))
+        self.grid = grid
+        self.gdim = gdim
+        self.calculator = IntegralCalculator(grid, gdim)
+
+        self._library = None    
+
+        if use_centroids:
+            self._nodes = grid.cell_centers().points
         else:
-            self.basis_sens.append(self.sens_class.define(xdofs[idx_max]))
-        
-        m += 1
+            self._nodes = grid.points   
+    
+    def _define(self, xm: np.ndarray, r: float):
+        r"""
+        Define an Indicator Function sensor given its parameters.
+
+        Parameters
+        ----------
+        xm: np.ndarray
+            The centre of mass of the Indicator Function sensor.
+        r: float
+            The radius of the Indicator Function sensor.
+
+        Returns
+        -------
+        kernel: function
+            The kernel function of the Indicator Function sensor.
+        """
+        def kernel(x):
+            return np.where(np.linalg.norm(x - xm, axis=1) <= r, 1.0, 0.0)
+
+        return kernel(self._nodes)
+    
+    def create_library(self, r: float, xm_list: np.ndarray = None,
+                          verbose: bool = False):
+          r"""
+          Create a library of Indicator Function sensors, given a radius and a list of centres of mass (if provided).
+          
+          Parameters
+          ----------
+          r: float
+                The radius of the Indicator Function sensors.
+          xm_list: np.ndarray, optional (default=None)
+                A list of centres of mass for the Indicator Function sensors. If None, the sensors are placed at the grid nodes.
+          verbose: bool, optional (default=False)
+                If True, print progress information.
+    
+          """
+    
+          if xm_list is None:
+                xm_list = self._nodes.tolist()
+
+          self.xm_list = xm_list
+    
+          self._library = FunctionsList(dofs = len(self._nodes))
+          if verbose:
+                progress = LoopProgress(msg="Creating Indicator Function Sensor Library", final=len(xm_list))
+    
+          for xm in xm_list:
+    
+                # Define and append the sensor to the library
+                self._library.append(
+                 self._define(xm=xm, r=r)
+                )
+    
+                # Update progress bar
+                if verbose:
+                 progress.update(1, percentage=True)
