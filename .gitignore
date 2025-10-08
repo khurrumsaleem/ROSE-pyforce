@@ -11,8 +11,8 @@ __pycache__/
 *.so
 
 # Tutorial Data
-docs/Tutorials/04_FlowOverCylinder_OF2012/OF_case/
-docs/Tutorials/04_FlowOverCylinder_OF2012/Snapshots/
+docs/Tutorials/Datasets/
+docs/Tutorials/Results/
 
 # Distribution / packaging
 .Python
