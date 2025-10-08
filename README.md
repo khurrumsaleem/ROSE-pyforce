@@ -15,7 +15,7 @@
 
 - [Description](#description)
 - [How to cite *pyforce*](#how-to-cite-pyforce)
-  - [Selected works with *pyforce*](#selected-works-with-pyforce)
+  - [Selected works using *pyforce*](#selected-works-using-pyforce)
 - [Installation](#installation)
 - [Tutorials](#tutorials)
 - [Authors and contributions](#authors-and-contributions)
@@ -84,40 +84,46 @@ keywords = {Hybrid Data-Assimilation, Generalized Empirical Interpolation Method
 
 ```
 
-### Selected works with *pyforce*
+### Selected works using *pyforce*
 
-- Stefano Riva, Sophie Deanesi, Carolina Introini, Stefano Lorenzi, and Antonio Cammi. Neutron Flux Reconstruction from Out-Core Sparse Measurements using Data-Driven Reduced Order Modelling. In International Conference on Physics of Reactors (PHYSOR24), San Francisco, USA, April 2024.
-- Matteo Lo Verso, Stefano Riva, Carolina Introini, Eric Cervi, Francesca Giacobbo, Laura Savoldi, Marcello Di Prinzio, Marco Caramello, Luciana Barucca, and Antonio Cammi, “Application of a non-intrusive Reduced Order Modelling approach to Magneto-HydroDynamics,” accepted for publication in Physics of Fluids, 2024.
-- Stefano Riva, Carolina Introini, Antonio Cammi, and J. Nathan Kutz, “Robust state estimation from partial out-core measurements with shallow recurrent decoder for nuclear reactors,” 2024. preprint available at [https://arxiv.org/abs/2409.12550](https://arxiv.org/abs/2409.12550).
-- Stefano Riva, Carolina Introini, Enrico Zio, and Antonio Cammi, “Impact of Malfunctioning Sensors on Data-Driven Reduced Order Modelling: Application to Molten Salt Reactors,” EPJ Web Conf., vol. 302, p. 17003, 2024.
+In addition to the above references, here are some selected works where *pyforce* has been used:
 
+- M. Lo Verso, S. Riva, C. Introini, E. Cervi, F. Giacobbo, L. Savoldi, M. Di Prinzio, M. Caramello, L. Barucca, and A. Cammi, “Application of a non-intrusive reduced order modeling approach to magnetohydrodynamics,” Physics of Fluids, vol. 36, p. 107167, 10 2024, [doi.org/10.1063/5.0230708](https://doi.org/10.1063/5.0230708).
+- S. Riva, C. Introini, A. Cammi, and J. N. Kutz, “Robust state estimation from partial out-core measurements with shallow recurrent decoder for nuclear reactors,” Progress in Nuclear Energy, vol. 189, p. 105928, 2025, [doi.org/10.1016/j.pnucene.2025.105928](https://doi.org/10.1016/j.pnucene.2025.105928)
+- S. Riva, C. Introini, E. Zio, and A. Cammi, “Data-driven reduced order modelling with malfunctioning sensors recovery applied to the molten salt reactor case,” EPJ Nuclear Sci. Technol., vol. 11, p. 55, 2025, [doi.org/10.1051/epjn/2025054](https://doi.org/10.1051/epjn/2025054)
+- S. Riva, S. Deanesi, C. Introini, S. Lorenzi, and A. Cammi, “Real-time state estimation of neutron flux in molten salt fast reactors from out-core sparse measurements,” Nuclear Science and Engineering, vol. 0, no. 0, pp. 1–14, 2025, [doi.org/10.1080/00295639.2025.2531477](https://doi.org/10.1080/00295639.2025.2531477).
 
 ## Installation
-The package can be installed using `pip`, make sure all the dependencies are installed (following these [steps](https://ermete-lab.github.io/ROSE-pyforce/installation.html#set-up-a-conda-environment-for-pyforce)). The requirements are listed [here](https://github.com/ERMETE-Lab/ROSE-pyforce/blob/main/pyforce/requirements.txt).
+The package can be installed using `pip`, including all the dependencies. At first, clone the repository
 
-It is suggested to create a conda environment: at first, clone the repository
 ```bash
 git clone https://github.com/ERMETE-Lab/ROSE-pyforce.git
-```
-create a conda environment using `environment.yml`
-```bash
 cd ROSE-pyforce
-conda env create -f pyforce/environment.yml
 ```
-activate the environment and then install the package using `pip`
+then install the package using `pip`
 ```bash
+python -m pip install pyforce/
+```
+It is recommended to install the package in a conda environment.
+
+The dependencies can be also installed manually or adopting the `environment.yml` file as follows:
+
+```bash
+conda env create -f pyforce/environment.yml
 conda activate pyforce-env
 python -m pip install pyforce/
 ```
 
+The requirements are listed [here](https://github.com/ERMETE-Lab/ROSE-pyforce/blob/main/pyforce/requirements.txt).
+
 ## Tutorials
-The *pyforce* package is tested on some tutorials available in the [docs](https://ermete-lab.github.io/ROSE-pyforce/tutorials.html), including fluid dynamics and neutronics problems.
+The *pyforce* package is tested on some tutorials available in the [docs](https://ermete-lab.github.io/ROSE-pyforce/tutorials.html), including fluid dynamics, neutronics and multi-physics problems or available in the `docs/Tutorials` folder. Each tutorial includes a Jupyter notebook:
 
-1. Laminar Flow over Cylinder (DFG2 benchmark): solved with *dolfinx*;
-2. Multi-Group Neutron Diffusion (ANL11-A2 benchmark): solved in *dolfinx*.
-3. Differentially Heated Cavity (buoyant Navier-Stokes): solved with OpenFOAM-6, as in [ROM4FOAM tutorial](https://ermete-lab.github.io/ROSE-ROM4FOAM/Tutorials/BuoyantCavity/problem.html).
-
-*Coming Soon*: multiphysics (neutronics+thermal-hydraulics) with *dolfinx* and OpenFOAM.
+0. First steps with *pyforce*: introduction to the package and its basic features.
+1. Introduction to Singular Value Decomposition (SVD) and Proper Orthogonal Decomposition (POD) and application to a fluid dynamics problem using the POD with Interpolation (POD-I) technique.
+2. Presentation of (Generalised) Empirical Interpolation Method ((G)EIM) and application to a bouyancy-driven fluid dynamics problem.
+3. Sensor positioning with (G)EIM and SGreedy algorithm and application of the Parameterised-Background Data-Weak (PBDW) formulation to a neutronics problem.
+4. TBD
 
 The snapshots can be either generated by the user or be downloaded at the following link [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15705990.svg)](https://zenodo.org/records/15705990)
 
@@ -126,9 +132,8 @@ The snapshots can be either generated by the user or be downloaded at the follow
 **pyforce** is currently developed and mantained at [Nuclear Reactors Group - ERMETE Lab](https://github.com/ERMETE-Lab) by
 
 - Stefano Riva
-- Carolina Introini
 
-under the supervision of Prof. Antonio Cammi.
+under the supervision of Dr. Carolina Introini and Prof. Antonio Cammi.
 
 If interested, please contact stefano.riva@polimi.it, carolina.introini@polimi.it, antonio.cammi@polimi.it
 

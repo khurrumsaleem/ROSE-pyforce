@@ -6,21 +6,24 @@
 
 [![Reference Paper 1](https://img.shields.io/badge/Reference%20Paper%201-10.1016/j.apm.2024.06.040-gray?labelColor=blue&style=flat&link=https://doi.org/10.1016/j.apm.2024.06.040)](https://doi.org/10.1016/j.apm.2024.06.040) [![Reference Paper 2](https://img.shields.io/badge/Reference%20Paper%202-10.1016/j.nucengdes.2024.113105-gray?labelColor=blue&style=flat&link=https://www.sciencedirect.com/science/article/pii/S002954932400205X)](https://www.sciencedirect.com/science/article/pii/S002954932400205X)
 
+[![Zenodo](https://img.shields.io/badge/Zenodo-purple?style=flat&link=https://zenodo.org/records/15705990)](https://zenodo.org/records/15705990)
 
 ## Description
 
-*pyforce* (Python Framework for data-driven model Order Reduction of multi-physiCs problEms) is a Python package implementing some Data-Driven Reduced Order Modelling (DDROM) techniques for applications to multi-physics problems, mainly set in the **nuclear engineering** world. These techniques have been implemented upon the [dolfinx](https://github.com/FEniCS/dolfinx) package (currently v0.6.0), part of the [FEniCSx](https://fenicsproject.org/) project, to handle mesh generation, integral calculation and functions storage. The package is part of the **ROSE (Reduced Order modelling with data-driven techniques for multi-phySics problEms)** which is one of the main research topics investigated at the [ERMETE-Lab](https://github.com/ERMETE-Lab#reduced-order-modelling-with-data-driven-techniques-for-multi-physics-problems-rose-): in particular, the focus of the research activities is on mathematical algorithms aimed at reducing the complexity of multi-physics models with a focus on nuclear reactor applications, searching for optimal sensor positions and integrating experimental data to improve the knowledge on the physical systems.
+*pyforce* (Python Framework for data-driven model Order Reduction of multi-physiCs problEms) is a Python package implementing some Data-Driven Reduced Order Modelling (DDROM) techniques for applications to multi-physics problems, mainly set in the **nuclear engineering** world. These techniques have been implemented upon the [pyvista](https://docs.pyvista.org/index.html) package to handle meshes, integral calculation and plotting functionalities. The package is part of the **ROSE (Reduced Order modelling with data-driven techniques for multi-phySics problEms)** framework which is one of the main research topics investigated at the [ERMETE-Lab](https://github.com/ERMETE-Lab#reduced-order-modelling-with-data-driven-techniques-for-multi-physics-problems-rose-): in particular, the focus of the research activities is on mathematical algorithms aimed at reducing the complexity of multi-physics models with a focus on nuclear reactor applications, searching for optimal sensor positions and integrating experimental data to improve the knowledge on the physical systems.
 
 At the moment, the following techniques have been implemented:
 
 - **Proper Orthogonal Decomposition** with Projection and Interpolation for the Online Phase
-- **Generalised Empirical Interpolation Method**, either with or without Tikhonov's regularisation
+- **Generalised Empirical Interpolation Method**, either with or without regularisation
 - **Parameterised-Background Data-Weak formulation**
+- **SGreedy algorithm** for optimal sensor positioning
 - an **Indirect Reconstruction** algorithm to reconstruct non-observable fields
+- a **recovery** procedure for malfunctioning sensors
 
 This package is aimed to be a valuable tool for other researchers, engineers, and data scientists working in various fields, not only restricted to the nuclear engineering world. This documentation includes a brief introduction to the world of Reduced Order Modelling and dimensionality reduction, the API documentation and some examples of how to use the various modules of the package.
 
-This work has been carried out at the [Nuclear Reactors Group - ERMETE Lab](https://github.com/ERMETE-Lab) at [Politecnico di Milano](https://polimi.it), under the supervision of Prof. Antonio Cammi.
+This work has been carried out at the [Nuclear Reactors Group - ERMETE Lab](https://github.com/ERMETE-Lab) at [Politecnico di Milano](https://polimi.it), under the supervision of Prof. Antonio Cammi. The original development of the package started in 2022 during the [PhD research of Stefano Riva](https://github.com/Steriva/phd-thesis), and it is still ongoing: this package can be considered as an evolution of the [ROM4FOAM](https://github.com/ERMETE-Lab/ROSE-ROM4FOAM), developed in OpenFOAM-v6 in 2018-2021.
 
 ---
 
