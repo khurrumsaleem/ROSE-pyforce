@@ -156,7 +156,6 @@ class GEIM(OnlineDDROM):
         # Compute Tikhonov matrix
         self.tikhonov['T'] = np.diag(1.0 / (self.tikhonov['beta_std'] + 1e-16)) # shape (M, M)
 
-
     def get_measurements(self, snaps: FunctionsList | np.ndarray, M: int = None,
                          noise_std: float = 0.0):
         r"""

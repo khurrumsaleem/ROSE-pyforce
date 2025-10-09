@@ -70,20 +70,13 @@ class OnlineDDROM(ABC):
 
 class SurrogateModelWrapper(ABC):
     """
-    A wrapper class for surrogate models to predict coefficients based on test parameters.
+    A wrapper class for surrogate models to predict coefficients based on input vector (it can be either test parameters or measurements).
     """
-
-    @property
-    def models(self):
-        """
-        Property to access the surrogate models (can be a list of models).
-        """
-        return self._models
 
     @abstractmethod
     def predict(self, input_vector: np.ndarray, **kwargs) -> np.ndarray:
         r"""
-        Predict coefficients based on the provided input vector.
+        Predict coefficients based on the provided input vector of size :math:`(N_s, N_p)`, where :math:`N_s` is the number of samples and :math:`N_p` is the degrees of freedom of the input vector (for instance, either the number of parameters or the number of sensors).
 
         Parameters
         ----------

@@ -109,7 +109,7 @@ class StandardScaler(ScalerWrapper):
         
         for ii in range(len(X)):
             _new_X.append( 
-                (X(ii) - self._mean) / (self._std if self.with_std else 1)
+                (X(ii) - self._mean) / (self._std+1e-12 if self.with_std else 1)
             )
 
         return _new_X
@@ -129,11 +129,10 @@ class StandardScaler(ScalerWrapper):
         
         for ii in range(len(X)):
             _new_X.append(
-                X(ii) * (self._std if self.with_std else 1) + self._mean
+                X(ii) * (self._std if self.with_std+1e-12 else 1) + self._mean
             )
 
         return _new_X
-
 
 class MinMaxScaler(ScalerWrapper):
     """
@@ -185,7 +184,7 @@ class MinMaxScaler(ScalerWrapper):
         
         for ii in range(len(X)):
             _new_X.append(
-                (X(ii) - self._min) / (self._max - self._min)
+                (X(ii) - self._min) / (self._max - self._min + 1e-12)
             )
 
         return _new_X

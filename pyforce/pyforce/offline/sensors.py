@@ -54,10 +54,10 @@ class SensorLibraryBase(ABC):
         if isinstance(func, FunctionsList):
             _output = list()
             for f in func:
-                _output.append(self._action(f, **kwargs))
+                _output.append(self.action(f, **kwargs))
             return np.array(_output).T # shape (Nsensors, Ns)
         elif isinstance(func, np.ndarray):
-            return self._action(func, **kwargs).reshape(-1, 1) # shape (Nsensors, 1)
+            return self.action(func, **kwargs).reshape(-1, 1) # shape (Nsensors, 1)
         else:
             raise TypeError("Input must be a FunctionsList or a numpy array.")
 
