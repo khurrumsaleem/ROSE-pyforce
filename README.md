@@ -26,9 +26,11 @@
 
 ## Description
 
-*pyforce* is a Python package implementing Data-Driven Reduced Order Modelling (DDROM) techniques for applications to multi-physics problems, mainly set in the **Nuclear Engineering** world. These techniques have been implemented upon the [dolfinx](https://github.com/FEniCS/dolfinx) package (currently v0.6.0), part of the [FEniCSx](https://fenicsproject.org/) project, to handle mesh generation, integral calculation and functions storage. The package is part of the **ROSE (Reduced Order modelling with data-driven techniques for multi-phySics problEms)**: mathematical algorithms aimed at reducing the complexity of multi-physics models (for nuclear reactors applications), at searching for optimal sensor positions and at integrating real measures to improve the knowledge on the physical systems.
+*pyforce* is a Python package implementing Data-Driven Reduced Order Modelling (DDROM) techniques for applications to multi-physics problems, mainly set in the **Nuclear Engineering** world. The package is part of the **ROSE (Reduced Order modelling with data-driven techniques for multi-phySics problEms)**: mathematical algorithms aimed at reducing the complexity of multi-physics models (for nuclear reactors applications), at searching for optimal sensor positions and at integrating real measures to improve the knowledge on the physical systems.
 
-The techniques implemented here follow the same underlying idea expressed in the following figure: in the offline (training) phase, a dimensionality reduction process retrieves a reduced coordinate system onto which encodes the information of the mathematical model; the sensor positioning algorithm then uses this set to select the optimal location of sensors according to some optimality criterion, which depends on the adopted algorithm. In the online phase, the DA process begins, retrieving a novel set of reduced variables and then computing the reconstructed state through a decoding step.
+With respect to the previous original implementation based on [dolfinx](https://github.com/FEniCS/dolfinx) package (v0.6.0), version 1.0.0 of *pyforce* has been completely re-written using `pyvista` as backend for mesh importing, computing integrals, and visualisation of results; in addition, functions are stored as `numpy` arrays, improving the ease of use of the package. **This choice allows to use *pyforce* with any software solver able to export results in VTK format.**
+
+The techniques implemented here follow the same underlying idea expressed in the following figure: in the offline (training) phase, a dimensionality reduction process retrieves a reduced coordinate system onto which encodes the information of the mathematical model; the sensor positioning algorithm then uses this set to select the optimal location of sensors according to some optimality criterion, which depends on the adopted algorithm. In the online phase, the DA process begins, retrieving a novel set of reduced variables and then computing the reconstructed state through a decoding step [Riva et al. (2024)](https://doi.org/10.1016/j.apm.2024.06.040).
 
 <p align="center">
   <img alt="DDROMstructure" src="images/tie_frighter.svg" width="850" />
@@ -37,9 +39,12 @@ The techniques implemented here follow the same underlying idea expressed in the
 
 At the moment, the following techniques have been implemented:
 
+- **Singular Value Decomposition** (randomised), with Projection and Interpolation for the Online Phase
 - **Proper Orthogonal Decomposition** with Projection and Interpolation for the Online Phase
+- **Empirical Interpolation Method**, either regularised with Tikhonov or not
 - **Generalised Empirical Interpolation Method**, either regularised with Tikhonov or not
 - **Parameterised-Background Data-Weak formulation**
+- **SGreedy** algorithm for optimal sensor positioning
 - an **Indirect Reconstruction** algorithm to reconstruct non-observable fields
 
 This package is aimed to be a valuable tool for other researchers, engineers, and data scientists working in various fields, not only restricted in the Nuclear Engineering world.
@@ -94,17 +99,22 @@ In addition to the above references, here are some selected works where *pyforce
 - S. Riva, S. Deanesi, C. Introini, S. Lorenzi, and A. Cammi, “Real-time state estimation of neutron flux in molten salt fast reactors from out-core sparse measurements,” Nuclear Science and Engineering, vol. 0, no. 0, pp. 1–14, 2025, [doi.org/10.1080/00295639.2025.2531477](https://doi.org/10.1080/00295639.2025.2531477).
 
 ## Installation
-The package can be installed using `pip`, including all the dependencies. At first, clone the repository (this will clone the official one)
+
+It is recommended to install the package in a conda environment, although it is not strictly required.
+
+The simplest way to install the package is through using `pip`, including all the dependencies.
+
+**Here's how**: at first, clone the repository (this will clone the official one)
 
 ```bash
 git clone https://github.com/ERMETE-Lab/ROSE-pyforce.git
 cd ROSE-pyforce
 ```
 
-if you want to install the development version, clone the repo from Steriva's account
+*If you want to install the development version*, clone the repo from Steriva's account
 
 ```bash
-git clone --branch pyforce2.0-dev --single-branch https://github.com/ERMETE-Lab/ROSE-pyforce.git
+git clone --branch development --single-branch https://github.com/ERMETE-Lab/ROSE-pyforce.git
 cd ROSE-pyforce
 ```
 
@@ -114,9 +124,7 @@ then install the package using `pip` (this will work if you already have `python
 python -m pip install pyforce/
 ```
 
-It is recommended to install the package in a conda environment.
-
-If you face issues with rendering figures with `pyvista`, please install the dependencies adopting the `environment.yml` file as follows:
+Another option is also provided adopting the `environment.yml` file as follows (If you face issues with rendering figures with `pyvista`, this might solve the problem):
 
 ```bash
 conda env create -f pyforce/environment.yml
@@ -134,8 +142,9 @@ The *pyforce* package is tested on some tutorials available in the [docs](https:
 2. Presentation of (Generalised) Empirical Interpolation Method ((G)EIM) and application to a bouyancy-driven fluid dynamics problem.
 3. Sensor positioning with (G)EIM and SGreedy algorithm and application of the Parameterised-Background Data-Weak (PBDW) formulation to a neutronics problem.
 4. Reconstruction of Unobservable fields from temperature measurements using Parameter Estimation + POD with Interpolation and Gaussian Process Regression, applied to a bouyancy-driven fluid dynamics problem.
+5. State Estimation in Molten Salt Fast Reactors (MSFR) with failing sensors using GEIM and PBDW techniques.
 
-The snapshots can be either generated by the user or be downloaded at the following link [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15705990.svg)](https://zenodo.org/records/15705990)
+The snapshots can be downloaded at the following link ... or contact Stefano Riva for further information.
 
 ## Authors and contributions
 
