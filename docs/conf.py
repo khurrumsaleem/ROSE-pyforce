@@ -75,8 +75,8 @@ autodoc_mock_imports = ["pyvista", "h5py"]
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 # Options for HTML output
-# html_theme = 'sphinx_rtd_theme'
-html_theme = 'pydata_sphinx_theme'
+html_theme = 'sphinx_rtd_theme'
+# html_theme = 'pydata_sphinx_theme'
 
 html_logo = "images/pyforce_logo.png"
 html_theme_options = {
