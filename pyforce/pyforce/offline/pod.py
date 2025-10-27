@@ -684,3 +684,205 @@ class POD(OfflineDDROM):
                              **kwargs)
 
         np.save(os.path.join(path_folder, f'eigenvalues_{self.varname}.npy'), self.eigenvalues)
+
+class HierarchicalSVD(rSVD):
+    r"""
+    A class to perform hierarchical Singular Value Decomposition (hSVD) from `Iwen and Ong (2016) <https://epubs.siam.org/doi/10.1137/140971500>`_. This class inherits from the `rSVD` class and extends its functionality to perform hSVD and update the SVD modes accordingly. This method is particularly useful for large datasets where a hierarchical approach can improve computational efficiency, especially when dealing with parametric problems.
+
+    Parameters
+    ----------
+    grid : pyvista.UnstructuredGrid
+        The grid on which the hSVD is performed. It is used to define the spatial domain of the snapshots.
+    gdim : int, optional (Default = 3)
+        The geometric dimension of the grid. It can be either 2 or 3.
+    varname : str, optional (default='u')
+        The name of the variable to be used for the hSVD. Default is 'u'.
+
+    """
+
+    def __init__(self, grid, gdim=3, varname='u', **kwargs):
+        super().__init__(grid, gdim, varname, **kwargs)
+
+        self.svd_modes = None
+        self.singular_values = None
+
+    def update(self, train_snaps: FunctionsList = None, new_modes: FunctionsList = None, new_sing_vals: np.ndarray = None, rank: int = None,
+               **kwargs):
+        r"""
+        This method updates the SVD modes and singular values using the hierarchical SVD approach, either using new training snapshots or directly providing new modes and singular values.
+
+        Parameters
+        ----------
+        train_snaps : FunctionsList, optional
+            New training snapshots used to compute the new SVD modes and singular values.
+        new_modes : FunctionsList, optional
+            New SVD modes to be used for the update.
+        new_sing_vals : np.ndarray, optional
+            New singular values to be used for the update.
+
+        """
+
+        if rank is not None:
+            _rank = rank
+        else:
+            _rank = len(self.singular_values) if self.singular_values is not None else len(train_snaps)
+
+        if train_snaps is not None:
+            # Perform rSVD on the new training snapshots
+            _U_new, _S_new, _ = randomized_svd(train_snaps.return_matrix(), n_components=_rank, **kwargs)
+
+            new_modes = FunctionsList(train_snaps.fun_shape)
+            new_modes.build_from_matrix(_U_new)
+            new_sing_vals = _S_new
+        else:
+            assert new_modes is not None and new_sing_vals is not None, "Either train_snaps or both new_modes and new_sing_vals must be provided."
+
+        if self.svd_modes is None:
+            # First update, simply assign the new modes and singular values
+            self.svd_modes = new_modes
+            self.singular_values = new_sing_vals
+        else:
+            _A = np.hstack([self.svd_modes.return_matrix() @ np.diag(self.singular_values),
+                            new_modes.return_matrix() @ np.diag(new_sing_vals)])
+            
+            _U_updated, _S_updated, _ = randomized_svd(_A, n_components=_rank, **kwargs)
+
+            # Update the SVD modes and singular values
+            self.svd_modes = FunctionsList(self.svd_modes.fun_shape)
+            self.svd_modes.build_from_matrix(_U_updated)
+            self.singular_values = _S_updated
+
+class IncrementalSVD(rSVD):
+    r"""
+    A class to perform incremental Singular Value Decomposition (iSVD) from `Brand (2002) <https://link.springer.com/chapter/10.1007/3-540-47969-4_47>`_. This class inherits from the `rSVD` class and extends its functionality to perform iSVD and update the SVD modes accordingly. This method is particularly useful for streaming data or when new snapshots become available over time.
+
+    Parameters
+    ----------
+    grid : pyvista.UnstructuredGrid
+        The grid on which the iSVD is performed. It is used to define the spatial domain of the snapshots.  
+    gdim : int, optional (Default = 3)
+        The geometric dimension of the grid. It can be either 2 or 3.
+    varname : str, optional (default='u')
+        The name of the variable to be used for the iSVD. Default is 'u'.
+
+    """
+
+    def __init__(self, grid, gdim=3, varname='u', **kwargs):
+        super().__init__(grid, gdim, varname, **kwargs)
+
+        self.svd_modes = None
+        self.singular_values = None
+
+    
+    def fit(self, train_snaps: FunctionsList, rank: int, verbose: bool=False, **kwargs):
+        r"""
+        This method is used to perform the randomized SVD on the training snapshots.
+
+        Parameters
+        ----------
+        train_snaps : FunctionsList
+            The training snapshots used to compute the rSVD modes.
+        rank : int
+            The rank for the truncated SVD.
+        verbose : bool, optional
+            If True, print progress messages. Default is False.
+        kwargs : dict, optional
+            Additional keyword arguments for the SVD solver.
+        """
+
+        self.Ns = len(train_snaps)
+        self.Nh = train_snaps.fun_shape
+        self.rank = rank
+
+        if verbose:
+            print('Computing ' + self.varname + ' SVD', end='\r')
+
+        _time = Timer()
+        _time.start()
+
+        _U, _S, _Vh = randomized_svd(train_snaps.return_matrix(), n_components=rank, **kwargs)
+
+        self.singular_values = _S
+        self.svd_modes = FunctionsList(train_snaps.fun_shape)
+        self.svd_modes.build_from_matrix(_U)
+        self.Vh = _Vh
+
+        elapsed_time = _time.stop()
+        if verbose:
+            print(f"SVD of {self.varname} snapshots calculated in {elapsed_time:.6f} seconds (cpu).")
+
+    def update(self, new_snap: FunctionsList | np.ndarray):
+        r"""
+        This method updates the SVD modes and singular values using the incremental SVD approach with a new snapshot.
+        """
+
+        if isinstance(new_snap, FunctionsList):
+            new_snap = new_snap.return_matrix()
+        elif isinstance(new_snap, np.ndarray):
+            if new_snap.ndim == 1:
+                new_snap = np.atleast_2d(new_snap).T # shape (Nh, 1)
+        else:
+            raise TypeError("Input must be a FunctionsList or a numpy ndarray.")
+        
+        # Step 1: eigen-decom (projection onto the existing SVD modes)
+        L, num_new_snaps = self._eigen_decomposition(new_snap)
+
+        # Step 2: non-orthogonal components over the existing SVD modes with QR
+        J, K = self._qr_decomposition(L, new_snap)
+
+        # Step 3: new SVD
+        Uplus, Splus, Vhplus = self._compute_new_svd(L, K)
+
+        # Step 4: update the SVD
+        self.svd_modes = FunctionsList(snap_matrix = np.hstack([self.svd_modes.return_matrix(), J]) @ Uplus)
+        self.singular_values = Splus
+        
+        tmp_V = np.vstack([ np.hstack([self.Vh.T, np.zeros((self.Vh.shape[1], J.shape[1]))]), 
+                            np.hstack([np.zeros((J.shape[1], self.Vh.shape[0])), np.eye(J.shape[1])])])
+        self.Vh = (tmp_V @ Vhplus.T).T
+
+        # Update number of snapshots and check SVD dimensions
+        self.Ns += num_new_snaps
+        self._check_svd()
+
+    def _eigen_decomposition(self, new_data: np.ndarray):
+        """
+        This method performs the eigen-decomposition step of the incremental SVD algorithm.
+        """
+        L = self.svd_modes.return_matrix().T @ new_data
+        num_new_snaps = new_data.shape[1]
+        
+        assert L.shape[0] == self.rank
+        assert L.shape[1] == num_new_snaps
+
+        return L, num_new_snaps
+
+    def _qr_decomposition(self, L: np.ndarray, new_data: np.ndarray):
+        """
+        This method performs the QR decomposition step of the incremental SVD algorithm.
+        """
+        H = new_data - self.svd_modes.return_matrix() @ L
+
+        J, K = np.linalg.qr(H)
+
+        return J, K
+    
+    def _compute_new_svd(self, L: np.ndarray, K: np.ndarray):
+        """
+        This method computes the new SVD after the eigen-decomposition and QR decomposition steps.
+        """
+        Q = np.vstack([np.hstack([np.diag(self.singular_values), L]),
+                        np.hstack([np.zeros((K.shape[0], self.singular_values.shape[0])), K])])
+
+        Uplus, Splus, Vhplus = randomized_svd(Q, n_components=self.rank)
+
+        return Uplus, Splus, Vhplus
+
+    def _check_svd(self):
+        assert self.svd_modes.return_matrix().shape[0] == self.Nh
+        assert self.svd_modes.return_matrix().shape[1] == self.rank
+        assert self.singular_values.shape[0] == self.rank
+        assert self.Vh.shape[0] == self.rank
+        assert self.Vh.shape[1] == self.Ns
+
+    
